@@ -308,8 +308,38 @@ void fillrow_case(int number) {
 
 // mask: position x blend byte x color flags x color, indexed source with an indexed alpha mask.
 constexpr std::array<Position, 3> mask_positions = {{{0, 0, 2, 2, 8, 8}, {4, 2, 1, 1, 8, 8}, {-2, 0, 2, 2, 8, 8}}};
-constexpr int mask_cases = 3 * 8 * 2 * 3;
+constexpr int mask_matrix_cases = 3 * 8 * 2 * 3;
+constexpr int city_gate_mask_cases = 2;
+void city_gate_mask_case(int number) {
+    constexpr int size = 320;
+    reset_state(size);
+    void* source = api.load("images/module_stadtkarte/Stadttor-mitte(Mark).aim", 0x01000007);
+    void* mask = api.load("images/module_stadtkarte/fogmaps/Stadttor-mitte(Mark).aim", 0x01000007);
+    void* target = make_target(size);
+    const bool clipped = number == mask_matrix_cases;
+    std::printf("%d city gate first draw %s", number, clipped ? "clipped" : "full");
+    std::fflush(stdout);
+    if (!source || !mask || !target) {
+        std::fputs("Cannot load the city gate mask fixture\n", stderr);
+        std::exit(8);
+    }
+    api.set_source(source);
+    api.set_target(target);
+    const auto result = api.draw_masked(reinterpret_cast<std::uintptr_t>(mask), 0, 0,
+        clipped ? 279 : 0, clipped ? -73 : 0, clipped ? 10 : 58, 109);
+    reset_state(size);
+    std::printf(" result=%d", result);
+    print_target(target, size);
+    api.free_texture(source);
+    api.free_texture(mask);
+    api.free_texture(target);
+}
+
 void mask_case(int number) {
+    if (number >= mask_matrix_cases) {
+        city_gate_mask_case(number);
+        return;
+    }
     int rest = number;
     const auto position = mask_positions[rest % 3]; rest /= 3;
     const auto color = colors[rest % 3]; rest /= 3;
@@ -602,7 +632,7 @@ const std::array<Suite, 13> suites = {{
     {"clip", [] { return clip_cases; }, clip_case},
     {"fill", [] { return fill_cases; }, fill_case},
     {"fillrow", [] { return fillrow_cases; }, fillrow_case},
-    {"mask", [] { return mask_cases; }, mask_case},
+    {"mask", [] { return mask_matrix_cases + city_gate_mask_cases; }, mask_case},
     {"blt", [] { return blt_cases; }, blt_case},
     {"bltrc", [] { return bltrc_cases; }, bltrc_case},
     {"clear", [] { return clear_cases; }, clear_case},
@@ -692,7 +722,8 @@ int wmain(int argc, wchar_t** argv) {
     api.set_key(key);
     if (!api.initialize()) return 5;
     api.set_key(key);
-    if (std::strcmp(suite->name, "assets") == 0 || std::strcmp(suite->name, "text") == 0) {
+    if (std::strcmp(suite->name, "assets") == 0 || std::strcmp(suite->name, "text") == 0 ||
+        (std::strcmp(suite->name, "mask") == 0 && last >= mask_matrix_cases)) {
         const HMODULE archiver = GetModuleHandleW(L"archiver.dll");
         void* (__cdecl* create_container)(int) = nullptr;
         int (__cdecl* append_archive)(void*, const char*) = nullptr;

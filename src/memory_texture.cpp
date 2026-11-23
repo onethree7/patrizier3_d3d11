@@ -2407,7 +2407,7 @@ extern "C" int __cdecl sgl_DrawBitmapRectWithAlphaMask(std::uint32_t mask_handle
     auto& dst = *target->second;
     if (src.image.format != sgl::ImageFormat::Indexed8 || alpha.image.format != sgl::ImageFormat::Indexed8 ||
         src.image.width != alpha.image.width || src.image.height != alpha.image.height ||
-        src.image.pitch != alpha.image.pitch || src.image.palette.size() != 1024 ||
+        src.image.pitch != alpha.image.pitch ||
         dst.image.format == sgl::ImageFormat::Indexed8) {
         char message[256] = {};
         std::snprintf(message, sizeof(message),
