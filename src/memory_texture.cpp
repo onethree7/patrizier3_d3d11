@@ -2426,6 +2426,9 @@ extern "C" void __cdecl sgl_StretchBitmapRect(int sx, int sy, int dx, int dy,
 
 extern "C" int __cdecl sgl_DrawBitmapRectWithAlphaMask(std::uint32_t mask_handle,
     int sx, int sy, int dx, int dy, int width, int height) {
+    // The original resolves 0 and the negative handles to a screen surface, which never matches the indexed source in
+    // size and pitch, and then draws nothing. The city fog draws with mask 0 when its sprite has no fogmap.
+    if (static_cast<std::int32_t>(mask_handle) <= 0) return 1;
     std::lock_guard<TexturesMutex> lock(textures_mutex);
     const auto source = textures.find(render_source);
     const auto target = textures.find(render_destination);
