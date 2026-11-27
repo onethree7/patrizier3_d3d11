@@ -20,7 +20,9 @@ public:
 
     HRESULT initialize(ID3D11Device* device, HWND window, UINT width, UINT height,
         DisplayMode mode = DisplayMode::Borderless) noexcept;
-    HRESULT initialize_configured(ID3D11Device* device, HWND window, const std::filesystem::path& path, std::string& error);
+    // game_size set: the game owns its layout; any valid render size is accepted (see display_config).
+    HRESULT initialize_configured(ID3D11Device* device, HWND window, const std::filesystem::path& path, std::string& error,
+        std::optional<DisplaySize> game_size = std::nullopt);
     HRESULT set_render_size(UINT width, UINT height) noexcept;
     void close() noexcept;
     HRESULT draw(ID3D11DeviceContext* context, Compositor& compositor, ID3D11ShaderResourceView* source,
@@ -32,6 +34,8 @@ public:
     DisplayMode display_mode() const noexcept { return mode_; }
     std::optional<unsigned> max_fps() const noexcept { return max_fps_; }
     void set_show_fps(bool show) noexcept { show_fps_ = show; fps_overlay_.reset(); }
+    bool show_fps() const noexcept { return show_fps_; }
+    bool exact_blend() const noexcept { return exact_blend_; }
     const FpsOverlay& fps_overlay() const noexcept { return fps_overlay_; }
 
 private:
@@ -59,7 +63,10 @@ private:
     bool window_change_in_progress_ = false;
     int revealed_cursor_count_ = 0;
     std::optional<unsigned> max_fps_;
+    UINT sync_interval_ = 1;
     bool show_fps_ = false;
+    bool exact_blend_ = true;
+    bool any_render_size_ = false;
     FpsOverlay fps_overlay_;
 };
 

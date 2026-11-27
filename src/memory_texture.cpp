@@ -1,6 +1,8 @@
 #include "archive_reader.hpp"
 #include "archive_state.hpp"
+#include "build_config.hpp"
 #include "color_key.hpp"
+#include "game_executable.hpp"
 #include "image_decoder.hpp"
 #include "game_resolution.hpp"
 #include "game_window_binding.hpp"
@@ -104,12 +106,27 @@ std::uint64_t clip_state_version = 0;
 // Changes whenever the active clipper or its rectangles change; keys the cached clipper bounds.
 std::uint64_t clipper_version = 0;
 
+// Also shown once in a message box: the game only reports a generic driver or SGL error, and under Wine the
+// debug output is not visible without extra logging.
 void report_screen_init_failure(const char* stage, const char* detail) noexcept {
-    OutputDebugStringA("Patrician III D3D11: ");
+    OutputDebugStringA(sgl::game::renderer_name());
+    OutputDebugStringA(": ");
     OutputDebugStringA(stage);
     OutputDebugStringA(": ");
     OutputDebugStringA(detail);
     OutputDebugStringA("\n");
+    static bool shown = false;
+    if (shown) return;
+    shown = true;
+    char text[1024] = {};
+    std::snprintf(text, sizeof(text), "%s:\n%s", stage, detail);
+    MessageBoxA(nullptr, text, sgl::game::renderer_name(), MB_OK | MB_ICONERROR | MB_TASKMODAL | MB_SETFOREGROUND);
+}
+
+void report_hresult_failure(const char* stage, const char* detail, HRESULT result) noexcept {
+    char text[512] = {};
+    std::snprintf(text, sizeof(text), "%s (HRESULT 0x%08lX)", detail, static_cast<unsigned long>(result));
+    report_screen_init_failure(stage, text);
 }
 
 struct Clipper {
@@ -204,12 +221,38 @@ struct Font {
 };
 std::unordered_map<void*, std::unique_ptr<Font>> fonts;
 sgl::SurfaceRenderer surface_renderer;
+// Attributes the readbacks made while it lives to an SGL export and the game address that called it (0 when unknown),
+// restoring the enclosing attribution afterwards.
+class ReadbackSite {
+public:
+    ReadbackSite(const char* site, const void* caller) noexcept : previous_site_(current_site), previous_caller_(current_caller) {
+        set(site, reinterpret_cast<std::uintptr_t>(caller));
+    }
+    ~ReadbackSite() { set(previous_site_, previous_caller_); }
+    ReadbackSite(const ReadbackSite&) = delete;
+    ReadbackSite& operator=(const ReadbackSite&) = delete;
+
+private:
+    static void set(const char* site, std::uintptr_t caller) noexcept {
+        static_cast<void>(site);
+        static_cast<void>(caller);
+        if constexpr (sgl::build::diagnostics) {
+            current_site = site;
+            current_caller = caller;
+            surface_renderer.set_readback_site(site, caller);
+        }
+    }
+    static inline const char* current_site = nullptr;
+    static inline std::uintptr_t current_caller = 0;
+    const char* previous_site_;
+    std::uintptr_t previous_caller_;
+};
 struct Screen {
     void* offscreen = nullptr;
     void* display = nullptr;
 };
 std::unique_ptr<Screen> screen;
-std::filesystem::path display_config_path;
+std::filesystem::path display_config_file;
 struct ViewState {
     int logical_width = 640;
     int logical_height = 480;
@@ -335,7 +378,8 @@ bool is_fast_forward_map(const char* name) noexcept {
 
 bool decode_wide_fast_forward_map(const char* name, sgl::ImageDecoder& decoder,
     sgl::DisplaySize size, bool pixels, sgl::DecodedImage& image) noexcept {
-    if (!is_fast_forward_map(name) || size.width <= 1280) return false;
+    // A patched executable ships its own fast-forward map layout for every size.
+    if (sgl::game_owns_layout() || !is_fast_forward_map(name) || size.width <= 1280) return false;
     try {
         const auto directory = game_directory();
         if (directory.empty()) return false;
@@ -661,6 +705,7 @@ bool is_game_chrome(const std::string& name) noexcept {
 
 bool stage_resolution_textures(sgl::DisplaySize size,
     std::vector<ResolutionTextureReplacement>& replacements) noexcept {
+    if (sgl::game_owns_layout()) return true;
     try {
         const auto has_replacements = std::any_of(textures.begin(), textures.end(), [](const auto& entry) {
             return is_game_chrome(entry.second->name) || is_fast_forward_map(entry.second->name.c_str());
@@ -769,7 +814,8 @@ void commit_resolution_textures(std::vector<ResolutionTextureReplacement>& repla
 }
 
 static bool resize_screen(sgl::DisplaySize size) noexcept {
-    if (!screen || !sgl::is_supported_display_size(size)) return false;
+    if (!screen || (sgl::game_owns_layout() ? !sgl::is_valid_display_size(size) : !sgl::is_supported_display_size(size)))
+        return false;
     auto offscreen = textures.find(screen->offscreen);
     auto display = textures.find(screen->display);
     if (offscreen == textures.end() || display == textures.end()) return false;
@@ -815,7 +861,7 @@ sgl::DisplayApplyResult sgl::apply_options_display_resolution(std::string& error
                 return DisplayApplyResult::Failed;
             }
         }
-        if (!save_display_config(display_config_path, size, surface_renderer.display_mode(), error)) {
+        if (!save_display_config(display_config_file, size, surface_renderer.display_mode(), error)) {
             try {
                 error = "The resolution changed for this session, but high_res.ini could not be saved: " + error;
             } catch (...) {
@@ -1098,12 +1144,16 @@ static void verify_city_scroll_executable() noexcept {
         0x6A, 0xFD, 0xE8, 0xEA, 0x89, 0xF2, 0xFF, 0x6A, 0xFD, 0xE8, 0xD3, 0x89, 0xF2, 0xFF, 0x8B, 0x44,
         0x24, 0x18, 0x8B, 0x4C, 0x24, 0x1C, 0x8B, 0x54, 0x24, 0x20, 0x6A, 0x04, 0x57, 0x53, 0x55, 0x50,
         0x51, 0x52, 0xE8, 0x5A, 0x83, 0xF2, 0xFF};
-    if (reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr)) != 0x400000) return;
-    auto* code = reinterpret_cast<const std::uint8_t*>(address);
-    MEMORY_BASIC_INFORMATION region{};
-    if (VirtualQuery(code, &region, sizeof(region)) != sizeof(region) || region.State != MEM_COMMIT ||
-        reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize < address + sizeof(original)) return;
-    city_executable_verified = std::memcmp(code, original, sizeof(original)) == 0;
+    // Patrician II has its own executable: none of the Patrician3.exe hooks apply, and the City Map patch is
+    // installed only after this check.
+    if (!sgl::game::patrician2()) {
+        if (reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr)) != 0x400000) return;
+        auto* code = reinterpret_cast<const std::uint8_t*>(address);
+        MEMORY_BASIC_INFORMATION region{};
+        if (VirtualQuery(code, &region, sizeof(region)) != sizeof(region) || region.State != MEM_COMMIT ||
+            reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize < address + sizeof(original)) return;
+        city_executable_verified = std::memcmp(code, original, sizeof(original)) == 0;
+    }
 }
 
 // City Map bottom band (R2). Three City Map passes in Patrician3.exe walk tile rows, 11 pixels apart, down to
@@ -1182,16 +1232,27 @@ extern "C" int __cdecl sgl_InitHardware() {
     if (hardware_initialized) return 1;
     try {
         HMODULE aim = load_game_library(L"AIM.dll");
-        if (!aim) return 0;
+        if (!aim) { report_screen_init_failure("initializing SGL hardware", "AIM.dll could not be loaded"); return 0; }
         HMODULE archive = nullptr;
         try { archive = load_game_library(L"archiver.dll"); }
         catch (...) { FreeLibrary(aim); throw; }
-        if (!archive) { FreeLibrary(aim); return 0; }
+        if (!archive) {
+            FreeLibrary(aim);
+            report_screen_init_failure("initializing SGL hardware", "archiver.dll could not be loaded");
+            return 0;
+        }
         const auto aim_vendor = reinterpret_cast<int (__cdecl*)(int, int)>(GetProcAddress(aim, "?AIM_SETVENDOR@@YAHHH@Z"));
         const auto archive_vendor = reinterpret_cast<int (__cdecl*)(int, int)>(GetProcAddress(archive, "arc_SetVendor"));
-        if (!aim_vendor || !archive_vendor || !aim_vendor(0, 0) || !archive_vendor(0, 0) || FAILED(surface_renderer.initialize())) {
+        if (!aim_vendor || !archive_vendor || !aim_vendor(0, 0) || !archive_vendor(0, 0)) {
             FreeLibrary(archive);
             FreeLibrary(aim);
+            report_screen_init_failure("initializing SGL hardware", "AIM.dll or archiver.dll rejected the vendor call");
+            return 0;
+        }
+        if (const HRESULT renderer = surface_renderer.initialize(); FAILED(renderer)) {
+            FreeLibrary(archive);
+            FreeLibrary(aim);
+            report_hresult_failure("initializing the Direct3D 11 renderer", surface_renderer.init_failure_stage(), renderer);
             return 0;
         }
         aim_library = aim;
@@ -1204,6 +1265,11 @@ extern "C" int __cdecl sgl_InitHardware() {
 }
 
 static void destroy_screen();
+
+// Menu layouts the renderer scales into the render size instead of resizing the screen.
+static bool is_logical_layout_size(std::uint32_t width, std::uint32_t height) noexcept {
+    return (width == 640 && height == 480) || (width == 800 && height == 600);
+}
 
 extern "C" void* __cdecl sgl_InitScreen(HWND window, int fullscreen, const char*, const std::uint32_t* settings) {
     verify_city_scroll_executable();
@@ -1220,20 +1286,25 @@ extern "C" void* __cdecl sgl_InitScreen(HWND window, int fullscreen, const char*
     const int logical_width = settings ? static_cast<int>(settings[0]) : 640;
     const int logical_height = settings ? static_cast<int>(settings[1]) : 480;
     try {
-        std::array<wchar_t, 32768> path{};
-        const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
-        if (!length || length == path.size()) {
-            report_screen_init_failure("locating game executable", "GetModuleFileNameW failed or truncated the path");
+        const auto config_path = sgl::display_config_path();
+        if (config_path.empty()) {
+            report_screen_init_failure("locating high_res.ini", "GetModuleFileNameW failed or truncated the DLL path");
             return nullptr;
         }
         std::string error;
-        const auto config_path = std::filesystem::path(path.data()).parent_path() / L"high_res.ini";
-        const HRESULT hr = surface_renderer.open_screen(window, config_path, error);
+        // A patched executable requests its own screen size (P2.CFG BREITE/HOEHE); render at that size.
+        std::optional<sgl::DisplaySize> game_size;
+        if (sgl::game_owns_layout()) {
+            game_size = sgl::DisplaySize{};
+            if (settings && !is_logical_layout_size(settings[0], settings[1]))
+                game_size = sgl::DisplaySize{settings[0], settings[1]};
+        }
+        const HRESULT hr = surface_renderer.open_screen(window, config_path, error, game_size);
         if (FAILED(hr)) {
-            report_screen_init_failure("opening D3D11 screen", error.c_str());
+            report_hresult_failure("opening D3D11 screen", error.empty() ? "window or swap chain setup failed" : error.c_str(), hr);
             return nullptr;
         }
-        display_config_path = config_path;
+        display_config_file = config_path;
         const auto size = surface_renderer.screen_size();
         auto offscreen = make_memory_texture(static_cast<std::uint16_t>(size.width), static_cast<std::uint16_t>(size.height), 0);
         auto display = make_memory_texture(static_cast<std::uint16_t>(size.width), static_cast<std::uint16_t>(size.height), 0);
@@ -1267,12 +1338,16 @@ extern "C" void* __cdecl sgl_InitScreen(HWND window, int fullscreen, const char*
             view_state.logical_height = previous_logical_height;
             return nullptr;
         }
-        if (!sgl::install_game_resolution(size, error)) {
-            report_screen_init_failure("installing game resolution", error.c_str());
-            destroy_screen();
-            view_state.logical_width = previous_logical_width;
-            view_state.logical_height = previous_logical_height;
-            return nullptr;
+        // Patrician III: without the game resolution hooks the game is not bound, so water_effect::install does
+        // nothing either. Patrician II has no resolution hooks; water_effect::install checks its executable itself.
+        if (!sgl::game::patrician2()) {
+            if (!sgl::install_game_resolution(size, error)) {
+                report_screen_init_failure("installing game resolution", error.c_str());
+                destroy_screen();
+                view_state.logical_width = previous_logical_width;
+                view_state.logical_height = previous_logical_height;
+                return nullptr;
+            }
         }
         if (!sgl::set_game_frame_limit(surface_renderer.max_fps()))
             OutputDebugStringA("Frame limit: the game's frame limiter does not match the verified executable\n");
@@ -1351,14 +1426,16 @@ extern "C" void __cdecl sgl_DestroyActiveScreen() {
 }
 
 extern "C" int __cdecl sgl_SwitchScreenMode(const std::uint32_t* requested_mode) {
+    const ReadbackSite readback_site("sgl_SwitchScreenMode", _ReturnAddress());
     // Legacy SGL callers use 16 as a mode tag; presentation and surfaces stay 32-bit.
     if (!requested_mode || (requested_mode[2] != 16 && requested_mode[2] != 32)) return 0;
     auto width = requested_mode[0], height = requested_mode[1];
-    const bool logical_layout = (width == 640 && height == 480) || (width == 800 && height == 600);
+    const bool logical_layout = is_logical_layout_size(width, height);
+    const bool game_layout = sgl::game_owns_layout();
     // Game views always use the resolution chosen in the options or high_res.ini. Some code paths, such as saving
     // with the P3Modding modloader, request the game's own resolution (1280x1024) instead; that would silently
-    // switch the game to it.
-    if (!logical_layout) {
+    // switch the game to it. A patched executable requests its own chosen size, which is used as is.
+    if (!logical_layout && !game_layout) {
         const auto chosen = sgl::current_game_resolution();
         if (sgl::is_supported_display_size(chosen)) {
             width = chosen.width;
@@ -1366,7 +1443,8 @@ extern "C" int __cdecl sgl_SwitchScreenMode(const std::uint32_t* requested_mode)
         }
     }
     const sgl::DisplaySize requested_size{width, height};
-    if (!logical_layout && !sgl::is_supported_display_size(requested_size)) return 0;
+    if (!logical_layout && (game_layout ? !sgl::is_valid_display_size(requested_size) :
+        !sgl::is_supported_display_size(requested_size))) return 0;
     {
         std::lock_guard<TexturesMutex> lock(textures_mutex);
         if (!screen) return 0;
@@ -1394,7 +1472,7 @@ extern "C" void __cdecl sgl_ShotDown() {
     if (aim_library) FreeLibrary(aim_library);
     archive_library = aim_library = nullptr;
     hardware_initialized = false;
-    display_config_path.clear();
+    display_config_file.clear();
 }
 
 extern "C" int __cdecl sgl_SwapBuffer(std::uint32_t flags) {
@@ -1416,10 +1494,16 @@ extern "C" int __cdecl sgl_SwapBuffer(std::uint32_t flags) {
 // defers synchronization and the effect runs on the GPU (SurfaceRenderer::draw_water) with the original's in-place
 // write order, so the CPU never waits for the GPU. When the GPU pass cannot run, the original runs on the CPU after a
 // readback of the tiles plus the largest displacement, and the tiles it wrote are uploaded.
+// Patrician 2.exe has the same effect function (0x56c0d0) instruction for instruction, apart from the address of its
+// saturation table, and the same lock, effect call and unlock in its city view (0x555f78 to 0x555fc4).
 namespace water_effect {
-constexpr std::uintptr_t lock_return = 0x5889e7;
-constexpr std::uintptr_t call_site = 0x588a25;
-constexpr std::uintptr_t function = 0x59e8e0;
+// Chosen once when the DLL loads, from the running executable.
+const bool patrician2 = sgl::game::patrician2();
+const std::uintptr_t lock_return = patrician2 ? 0x555f7d : 0x5889e7;
+// The game's sgl_LockTexture stub called right before lock_return.
+const std::uintptr_t lock_stub = patrician2 ? 0x4a7d20 : 0x4bbb00;
+const std::uintptr_t call_site = patrician2 ? 0x555fbd : 0x588a25;
+const std::uintptr_t function = patrician2 ? 0x56c0d0 : 0x59e8e0;
 // Object layout: width and height at +4 and +8, height bytes at +0x24 in rows of width + 2 bytes, tile list count at
 // +0x2c and (x, y) shorts every 8 bytes from +0x34, clamp tables at +0xbbb8 (x, byte offsets) and +0xbbbc (y, row
 // offsets) with the pitch they were built for at +0xbbc0, pixel offsets at +0xbbc4 and +0xbbc8.
@@ -1434,7 +1518,7 @@ constexpr std::size_t table_pitch_offset = 0xbbc0;
 constexpr std::size_t offset_x_offset = 0xbbc4;
 constexpr std::size_t offset_y_offset = 0xbbc8;
 // The color channels go through a saturation table indexed from -255 to 510.
-constexpr std::uintptr_t saturation_table = 0x6e52c7;
+const std::uintptr_t saturation_table = patrician2 ? 0x752d3f : 0x6e52c7;
 // Height differences of -255..255 displace reads by at most 126 pixels horizontally and 127 vertically.
 constexpr LONG read_margin = 128;
 bool installed = false;
@@ -1476,6 +1560,7 @@ void __fastcall hook(void* self, void* unused, std::uint8_t* pixels, int offset_
     int pitch) {
     RECT written{};
     bool partial = false;
+    const ReadbackSite readback_site("water effect", reinterpret_cast<const void*>(call_site));
     {
         std::lock_guard<TexturesMutex> lock(textures_mutex);
         const auto entry = lock_deferred ? textures.find(deferred_texture) : textures.end();
@@ -1542,14 +1627,34 @@ void __fastcall hook(void* self, void* unused, std::uint8_t* pixels, int offset_
     lock_deferred = false;
 }
 
-// Redirects the effect call after checking both call sites against the verified executable.
+// Patrician 2.exe at its preferred base with the expected timestamp, with both call sites in committed memory.
+bool patrician2_executable() noexcept {
+    if (!patrician2) return false;
+    for (const std::uintptr_t address : {lock_return - 5, call_site}) {
+        MEMORY_BASIC_INFORMATION region{};
+        if (VirtualQuery(reinterpret_cast<const void*>(address), &region, sizeof(region)) != sizeof(region) ||
+            region.State != MEM_COMMIT ||
+            reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize < address + 5) return false;
+    }
+    return true;
+}
+
+// Redirects the effect call after checking the executable and both call sites: Patrician III needs the verified
+// GOG executable's bindings, Patrician II its own executable.
 void install() noexcept {
-    if (installed || !sgl::game_binding_active()) return;
+    if (installed) return;
+    if (!patrician2) {
+        if (!sgl::game_binding_active()) return;
+    } else {
+        if (!patrician2_executable()) return;
+    }
     auto* const call = reinterpret_cast<std::uint8_t*>(call_site);
     const auto* const lock_call = reinterpret_cast<const std::uint8_t*>(lock_return - 5);
-    std::int32_t relative = 0;
+    std::int32_t relative = 0, lock_relative = 0;
     std::memcpy(&relative, call + 1, sizeof(relative));
-    if (call[0] != 0xe8 || call_site + 5 + relative != function || lock_call[0] != 0xe8) return;
+    std::memcpy(&lock_relative, lock_call + 1, sizeof(lock_relative));
+    if (call[0] != 0xe8 || call_site + 5 + relative != function || lock_call[0] != 0xe8 ||
+        lock_return + lock_relative != lock_stub) return;
     const auto hook_relative = static_cast<std::int32_t>(reinterpret_cast<std::uintptr_t>(&hook) - (call_site + 5));
     DWORD protection = 0, discarded = 0;
     if (!VirtualProtect(call + 1, sizeof(hook_relative), PAGE_EXECUTE_READWRITE, &protection)) return;
@@ -1580,6 +1685,7 @@ extern "C" int __cdecl sgl_LockTexture(void* handle, LockOutput* output, int fla
     // both (3) are treated as both here, so neither the read-back nor the upload is skipped.
     if (flags < 1 || flags > 3) flags = 3;
     const auto caller = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
+    const ReadbackSite readback_site("sgl_LockTexture", _ReturnAddress());
     std::lock_guard<TexturesMutex> lock(textures_mutex);
     const bool water_lock = water_effect::installed && caller == water_effect::lock_return &&
         reinterpret_cast<std::intptr_t>(handle) == -4 && flags == 3;
@@ -1605,6 +1711,7 @@ extern "C" int __cdecl sgl_LockTexture(void* handle, LockOutput* output, int fla
 }
 
 extern "C" void __cdecl sgl_UnlockTexture(void* handle) {
+    const ReadbackSite readback_site("sgl_UnlockTexture", _ReturnAddress());
     std::lock_guard<TexturesMutex> lock(textures_mutex);
     handle = screen_alias(handle);
     const auto entry = textures.find(handle);
@@ -1630,6 +1737,7 @@ extern "C" void __cdecl sgl_UnlockTexture(void* handle) {
 }
 
 extern "C" int __cdecl sgl_ChangePalette(void* handle, std::uint32_t* palette) {
+    const ReadbackSite readback_site("sgl_ChangePalette", _ReturnAddress());
     if (!handle) return 0;
     std::lock_guard<TexturesMutex> lock(textures_mutex);
     const auto entry = textures.find(handle);
@@ -1700,6 +1808,7 @@ extern "C" void* __cdecl sgl_SetRenderSource(void* handle) {
 }
 
 extern "C" void* __cdecl sgl_SetRenderDest(void* handle) {
+    const ReadbackSite readback_site("sgl_SetRenderDest", _ReturnAddress());
     std::lock_guard<TexturesMutex> lock(textures_mutex);
     handle = screen_alias(handle);
     auto next = textures.end();
@@ -1896,6 +2005,7 @@ extern "C" void __cdecl sgl_SetFont(const void* font) {
 
 static void* create_font(const unsigned char* characters, void* texture_handle, int glyph_width,
     int glyph_height, int spacing, int space_width, bool kerned, int fixed_width) {
+    const ReadbackSite readback_site("create_font", nullptr);
     if (!characters || !texture_handle) return nullptr;
     std::lock_guard<TexturesMutex> lock(textures_mutex);
     const auto entry = textures.find(texture_handle);
@@ -2049,6 +2159,7 @@ extern "C" std::uint32_t __cdecl sgl_SetBlendMode(std::uint32_t mode) {
 // Flag 1 clears the whole destination, ignoring the clip and the blend mode; the other flags do nothing. As measured
 // against the original, an opaque color replaces the pixels and any other color is blended by its alpha.
 extern "C" void __cdecl sgl_ClearBuffer(std::uint32_t flags, std::uint32_t color, float) {
+    const ReadbackSite readback_site("sgl_ClearBuffer", _ReturnAddress());
     std::lock_guard<TexturesMutex> lock(textures_mutex);
     if (!(flags & 1)) return;
     const auto entry = textures.find(render_destination);
@@ -2074,6 +2185,7 @@ extern "C" void __cdecl sgl_ClearBuffer(std::uint32_t flags, std::uint32_t color
 }
 
 extern "C" void __cdecl sgl_FillSolidRect(int x, int y, int width, int height) {
+    const ReadbackSite readback_site("sgl_FillSolidRect", _ReturnAddress());
     std::lock_guard<TexturesMutex> lock(textures_mutex);
     const auto entry = textures.find(render_destination);
     if (entry == textures.end()) return;
@@ -2299,6 +2411,7 @@ static void clear_display_border() {
 
 static void draw_bitmap(int sx, int sy, int dx, int dy, int width, int height, int dw, int dh,
     bool smooth_menu_text = false) {
+    const ReadbackSite readback_site("draw_bitmap", nullptr);
     std::lock_guard<TexturesMutex> lock(textures_mutex);
     Texture* const source_texture = find_texture_cached(render_source_lookup, render_source);
     Texture* const target_texture = find_texture_cached(render_destination_lookup, render_destination);
@@ -2663,6 +2776,7 @@ extern "C" void __cdecl sgl_DrawText_Rect(int x, int y, const std::int32_t* rect
 }
 
 static void blit_bitmap(int sx, int sy, int dx, int dy, int width, int height, std::uint32_t flags) {
+    const ReadbackSite readback_site("blit_bitmap", nullptr);
     const auto source = textures.find(render_source);
     const auto target = textures.find(render_destination);
     // As measured against the original: without a source or destination (an indexed destination is never
@@ -2691,8 +2805,7 @@ static void blit_bitmap(int sx, int sy, int dx, int dy, int width, int height, s
     if (left >= right || top >= bottom) return;
     if (render_source == render_destination && sx == dx && sy == dy) return;
     const bool self_copy = render_source == render_destination;
-    if (!lock_texture(src, nullptr, 1, false,
-        self_copy ? LockIntent::CpuPixels : LockIntent::GpuResource))
+    if (!lock_texture(src, nullptr, 1, false, LockIntent::GpuResource))
         sgl::unimplemented("sgl_Blt source lock");
     sgl::Rect source_rect{static_cast<float>(sx + left), static_cast<float>(sy + top),
         static_cast<float>(sx + right), static_cast<float>(sy + bottom)};
@@ -2704,17 +2817,10 @@ static void blit_bitmap(int sx, int sy, int dx, int dy, int width, int height, s
     const RECT bounds{0, 0, static_cast<LONG>(dst.image.width), static_cast<LONG>(dst.image.height)};
     const char* failure_stage = nullptr;
     if (self_copy) {
-        sgl::DecodedImage source_snapshot;
-        try { source_snapshot = src.image; }
-        catch (const std::bad_alloc&) {
-            unlock_texture(src);
-            sgl::unimplemented("sgl_Blt source snapshot allocation");
-        }
+        // The renderer snapshots the source region on the GPU, so the copy needs no readback of the surface.
+        const HRESULT self_copy_result = surface_renderer.copy_within(render_destination, dst.image, source_rect,
+            target_rect, bounds, &failure_stage);
         unlock_texture(src);
-        const HRESULT self_copy_result = surface_renderer.draw(&source_snapshot, source_snapshot,
-            render_destination, dst.image, source_rect, target_rect, bounds, std::nullopt,
-            sgl::BlendMode::Opaque, &failure_stage);
-        surface_renderer.forget(&source_snapshot);
         if (FAILED(self_copy_result)) {
             char draw_message[160]{};
             std::snprintf(draw_message, sizeof(draw_message), "sgl_Blt self-copy D3D11: %s failed (HRESULT 0x%08lX)",

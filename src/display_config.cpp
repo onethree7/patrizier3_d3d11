@@ -1,6 +1,7 @@
 #include "display_config.hpp"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <fstream>
 #include <iterator>
@@ -26,6 +27,19 @@ bool equal_ascii(std::string_view value, std::string_view expected) {
     return true;
 }
 
+// Its address identifies the module this file is linked into.
+const char module_marker = 0;
+
+}
+
+std::filesystem::path sgl::display_config_path() {
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&module_marker), &module)) return {};
+    std::array<wchar_t, 32768> path{};
+    const DWORD length = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
+    if (!length || length == path.size()) return {};
+    return std::filesystem::path(path.data()).parent_path() / L"high_res.ini";
 }
 
 bool sgl::is_supported_display_size(DisplaySize size) noexcept {
@@ -34,16 +48,52 @@ bool sgl::is_supported_display_size(DisplaySize size) noexcept {
         (size.width == 2560 && size.height == 1440);
 }
 
-bool sgl::display_config(HWND window, const std::filesystem::path& path, DisplayConfig& config, std::string& error) {
+bool sgl::is_valid_display_size(DisplaySize size) noexcept {
+    return size.width >= 640 && size.height >= 480 && size.width <= 8192 && size.height <= 8192;
+}
+
+bool sgl::display_size_from_game(const std::filesystem::path& path) {
+    if (path.empty()) return false;
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) return !ec;
+    // An unreadable file or a malformed value counts as a set size, so display_config reports it.
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return false;
+    bool in_display = false;
+    std::optional<unsigned> width, height;
+    std::string line;
+    while (std::getline(file, line)) {
+        const auto text = trim(line);
+        if (text.empty() || text.front() == ';' || text.front() == '#') continue;
+        if (text.front() == '[' && text.back() == ']') {
+            in_display = equal_ascii(text, "[display]");
+            continue;
+        }
+        if (!in_display) continue;
+        const auto equal = text.find('=');
+        if (equal == std::string_view::npos) continue;
+        const auto key = trim(text.substr(0, equal));
+        auto* const target = equal_ascii(key, "width") ? &width : equal_ascii(key, "height") ? &height : nullptr;
+        if (!target) continue;
+        const auto value = trim(text.substr(equal + 1));
+        unsigned number = 0;
+        const auto parsed = std::from_chars(value.data(), value.data() + value.size(), number);
+        *target = !value.empty() && parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size() ? number : 1u;
+    }
+    return !width || !height || !*width || !*height;
+}
+
+bool sgl::display_config(HWND window, const std::filesystem::path& path, DisplayConfig& config, std::string& error,
+    std::optional<DisplaySize> game_size) {
     error.clear();
     std::error_code ec;
     const bool exists = std::filesystem::exists(path, ec);
     if (ec) { error = "Cannot inspect high_res.ini: " + ec.message(); return false; }
     DisplayConfig selected{};
-    if (!exists) {
+    const auto desktop_size = [&]() {
         MONITORINFOEXW monitor = {};
         monitor.cbSize = sizeof(monitor);
-        const HMONITOR handle = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+        const HMONITOR handle = window ? MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST) : nullptr;
         DEVMODEW mode = {};
         mode.dmSize = sizeof(mode);
         if (!window || !IsWindow(window) || !handle || !GetMonitorInfoW(handle, &monitor) ||
@@ -52,10 +102,17 @@ bool sgl::display_config(HWND window, const std::filesystem::path& path, Display
             return false;
         }
         selected.size = {mode.dmPelsWidth, mode.dmPelsHeight};
+        return true;
+    };
+    const bool any_size = game_size.has_value();
+    const bool use_game_size = any_size && is_valid_display_size(*game_size);
+    if (!exists) {
+        if (use_game_size) selected.size = *game_size;
+        else if (!desktop_size()) return false;
     } else {
         std::ifstream file(path, std::ios::binary);
         if (!file) { error = "Cannot read high_res.ini"; return false; }
-        bool in_display = false, has_width = false, has_height = false, has_mode = false, has_max_fps = false, has_show_fps = false;
+        bool in_display = false, has_width = false, has_height = false;
         std::string line;
         unsigned line_number = 0;
         while (std::getline(file, line)) {
@@ -71,26 +128,30 @@ bool sgl::display_config(HWND window, const std::filesystem::path& path, Display
             if (equal == std::string_view::npos) { error = "high_res.ini line " + std::to_string(line_number) + ": expected key=value"; return false; }
             const auto key = trim(text.substr(0, equal));
             const auto value = trim(text.substr(equal + 1));
+            // Unknown keys are skipped and a repeated key takes its last value, so the file can be shared with
+            // other settings.
             unsigned* number = nullptr;
             bool* present = nullptr;
             if (equal_ascii(key, "width")) { number = &selected.size.width; present = &has_width; }
             else if (equal_ascii(key, "height")) { number = &selected.size.height; present = &has_height; }
             else if (equal_ascii(key, "mode")) {
-                if (has_mode) { error = "high_res.ini line " + std::to_string(line_number) + ": duplicate setting"; return false; }
-                has_mode = true;
                 if (equal_ascii(value, "windowed")) selected.mode = DisplayMode::Windowed;
                 else if (equal_ascii(value, "borderless")) selected.mode = DisplayMode::Borderless;
                 else { error = "high_res.ini line " + std::to_string(line_number) + ": mode must be windowed or borderless"; return false; }
                 continue;
             } else if (equal_ascii(key, "show_fps")) {
-                if (has_show_fps) { error = "high_res.ini line " + std::to_string(line_number) + ": duplicate setting"; return false; }
-                has_show_fps = true;
-                if (value == "1") selected.show_fps = true;
-                else if (value != "0") { error = "high_res.ini line " + std::to_string(line_number) + ": show_fps must be 0 or 1"; return false; }
+                if (value != "0" && value != "1") { error = "high_res.ini line " + std::to_string(line_number) + ": show_fps must be 0 or 1"; return false; }
+                selected.show_fps = value == "1";
+                continue;
+            } else if (equal_ascii(key, "vsync")) {
+                if (value != "0" && value != "1") { error = "high_res.ini line " + std::to_string(line_number) + ": vsync must be 0 or 1"; return false; }
+                selected.vsync = value == "1";
+                continue;
+            } else if (equal_ascii(key, "exact_blend")) {
+                if (value != "0" && value != "1") { error = "high_res.ini line " + std::to_string(line_number) + ": exact_blend must be 0 or 1"; return false; }
+                selected.exact_blend = value == "1";
                 continue;
             } else if (equal_ascii(key, "max_fps")) {
-                if (has_max_fps) { error = "high_res.ini line " + std::to_string(line_number) + ": duplicate setting"; return false; }
-                has_max_fps = true;
                 unsigned fps = 0;
                 const auto parsed = std::from_chars(value.data(), value.data() + value.size(), fps);
                 if (value.empty() || parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
@@ -100,8 +161,7 @@ bool sgl::display_config(HWND window, const std::filesystem::path& path, Display
                 }
                 selected.max_fps = fps;
                 continue;
-            } else { error = "high_res.ini line " + std::to_string(line_number) + ": unknown display setting"; return false; }
-            if (*present) { error = "high_res.ini line " + std::to_string(line_number) + ": duplicate setting"; return false; }
+            } else continue;
             *present = true;
             if (value.empty()) {
                 error = "high_res.ini line " + std::to_string(line_number) + ": expected a positive integer";
@@ -114,9 +174,16 @@ bool sgl::display_config(HWND window, const std::filesystem::path& path, Display
             }
         }
         if (file.bad()) { error = "Cannot read high_res.ini"; return false; }
-        if (!has_width || !has_height) { error = "high_res.ini requires [display] width and height"; return false; }
+        if (use_game_size) {
+            selected.size = *game_size;
+        } else if (any_size) {
+            if (!desktop_size()) return false;
+        } else if (!has_width || !has_height) {
+            error = "high_res.ini requires [display] width and height";
+            return false;
+        }
     }
-    if (!is_supported_display_size(selected.size)) {
+    if (any_size ? !is_valid_display_size(selected.size) : !is_supported_display_size(selected.size)) {
         error = "Unsupported display resolution " + std::to_string(selected.size.width) + "x" + std::to_string(selected.size.height);
         return false;
     }

@@ -1,4 +1,5 @@
 #include "game_resolution.hpp"
+#include "game_executable.hpp"
 #include "unimplemented.hpp"
 
 #include <windows.h>
@@ -17,7 +18,9 @@
 
 namespace {
 std::uint32_t game_width = 0, game_height = 0;
-std::uint8_t* game = nullptr;
+std::uint8_t* game_module = nullptr;
+// A patched executable lays out every screen size itself; only the frame limiter is shared with it.
+bool game_owned_layout = false;
 bool accelerated_map_loaded = false;
 sgl::DisplaySize accelerated_map_source{1280, 1024};
 std::uint8_t* accelerated_map_layout = nullptr;
@@ -45,7 +48,7 @@ constexpr std::array<sgl::DisplaySize, 4> supported_sizes = {{
 // a DRM section that decrypts .text at startup, and the modloader adds an import section. Their unchanged .rdata
 // section and link time identify the build; every patch still compares its own bytes in memory before writing.
 // Steam's AIM.dll differs from GOG's only in one header byte, so AIM.dll is identified by its code section.
-constexpr std::uint32_t executable_timestamp = 0x3f544d3c;
+constexpr std::uint32_t executable_timestamp = sgl::game::patrician3_timestamp;
 constexpr std::array<std::uint8_t, 32> executable_rdata_sha256 = {
     0x1f,0x5b,0x5a,0xb4,0xb9,0x9f,0x30,0x44,0x2a,0x84,0x75,0xb9,0x97,0xe9,0x2a,0x2c,
     0x26,0x9a,0x0d,0xcf,0x1a,0xab,0xad,0x16,0x46,0xf8,0x96,0xd7,0xe4,0x2b,0xc6,0x5a};
@@ -93,8 +96,8 @@ std::uint32_t __fastcall keep_32bit_color_depth(void*, void*) noexcept {
 }
 
 bool resize_accelerated_map_layout() noexcept {
-    if (!game || !accelerated_map_loaded) return false;
-    auto* const map = *reinterpret_cast<std::uint8_t**>(game + 0x2cba64);
+    if (!game_module || !accelerated_map_loaded) return false;
+    auto* const map = *reinterpret_cast<std::uint8_t**>(game_module + 0x2cba64);
     if (!map) return false;
 
     auto** const rectangles = *reinterpret_cast<std::uint8_t***>(map + 0x164 + 0xa0);
@@ -128,7 +131,7 @@ bool resize_accelerated_map_layout() noexcept {
     if (clip_active && !clip_matches) {
         const RECT bounds{0, 0, static_cast<LONG>(size.width), static_cast<LONG>(size.height)};
         using SetClip = void (__thiscall*)(void*, const RECT*);
-        reinterpret_cast<SetClip>(game + 0xb1ad0)(map, &bounds);
+        reinterpret_cast<SetClip>(game_module + 0xb1ad0)(map, &bounds);
     }
     accelerated_map_layout = map;
     accelerated_map_frame = frame;
@@ -146,7 +149,7 @@ void __fastcall place_fast_forward_map_ui_element(void* element, void*, std::uin
 
 void __fastcall load_accelerated_map(void* loader, void*, const char* path) {
     using Original = void (__thiscall*)(void*, const char*);
-    reinterpret_cast<Original>(game + 0x24f2c1)(loader, path);
+    reinterpret_cast<Original>(game_module + 0x24f2c1)(loader, path);
     if (path && std::strcmp(path, "./scripts/accelMap.ini") == 0) {
         accelerated_map_loaded = true;
         accelerated_map_layout = nullptr;
@@ -157,7 +160,7 @@ void __fastcall load_accelerated_map(void* loader, void*, const char* path) {
 }
 
 std::uint32_t __fastcall options_button_hit_test(void* button, void* options) noexcept {
-    if (!game || !button) return 0;
+    if (!game_module || !button) return 0;
     if (options) {
         auto* const options_bytes = static_cast<std::uint8_t*>(options);
         const bool is_decrement = button == options_bytes + 0x2a8;
@@ -168,13 +171,13 @@ std::uint32_t __fastcall options_button_hit_test(void* button, void* options) no
             auto* const enabled_state = static_cast<std::uint8_t*>(button) + 0x41;
             if (*enabled_state != enabled) {
                 using SetEnabled = char (__thiscall*)(void*, char);
-                reinterpret_cast<SetEnabled>(game + 0xb17f0)(button, enabled);
+                reinterpret_cast<SetEnabled>(game_module + 0xb17f0)(button, enabled);
             }
         }
     }
 
     using Original = std::uint32_t (__thiscall*)(void*);
-    return reinterpret_cast<Original>(game + 0xc78b0)(button);
+    return reinterpret_cast<Original>(game_module + 0xc78b0)(button);
 }
 
 __declspec(naked) void options_button_hit_test_hook() {
@@ -187,13 +190,13 @@ __declspec(naked) void options_button_hit_test_hook() {
 void __fastcall cancel_options_resolution(void* options, void*) {
     discard_options_resolution();
     using Original = void (__thiscall*)(void*);
-    reinterpret_cast<Original>(game + 0x60250)(options);
+    reinterpret_cast<Original>(game_module + 0x60250)(options);
 }
 
 void __fastcall apply_options_resolution(void* options, void*) noexcept {
     using Original = void (__thiscall*)(void*);
     try {
-        reinterpret_cast<Original>(game + 0x5df10)(options);
+        reinterpret_cast<Original>(game_module + 0x5df10)(options);
         std::string error;
         switch (sgl::apply_options_display_resolution(error)) {
         case sgl::DisplayApplyResult::Failed:
@@ -255,13 +258,13 @@ __declspec(naked) void scene_resolution_after() {
 }
 
 std::uint32_t __cdecl layout_width() {
-    return std::min(*reinterpret_cast<std::uint32_t*>(game + 0x2dcce0), 1280u);
+    return std::min(*reinterpret_cast<std::uint32_t*>(game_module + 0x2dcce0), 1280u);
 }
 
 std::uint32_t __cdecl position_sidebar() {
-    const auto width = *reinterpret_cast<std::uint32_t*>(game + 0x2dcce0);
+    const auto width = *reinterpret_cast<std::uint32_t*>(game_module + 0x2dcce0);
     if (width >= 1280) {
-        auto* ui = *reinterpret_cast<std::uint8_t**>(game + 0x2cbb40);
+        auto* ui = *reinterpret_cast<std::uint8_t**>(game_module + 0x2cbb40);
         if (!ui) sgl::unimplemented("game resolution: missing city layout");
         auto** rectangles = *reinterpret_cast<std::uint8_t***>(ui + 0xa90 + 0xa0);
         if (!rectangles || !rectangles[0]) sgl::unimplemented("game resolution: missing city frame");
@@ -611,16 +614,16 @@ void remove_aim_map_hook() noexcept {
 }
 
 namespace {
-// FUN_004bd180 runs once per frame: if fewer than 20 ms passed since the previous frame it sleeps for the rest,
-// otherwise Sleep(1). The accumulated timeGetTime delta drives game time, so the limit sets the frame rate only.
-// Bytes: cmp ecx, 20 / jae +0x18 / sub eax, esi / add eax, 20.
-constexpr std::size_t frame_limiter_rva = 0xbd1a9;
+// FUN_004bd180 (Patrician II: FUN_004a93c0) runs once per frame: if fewer than 20 ms passed since the previous frame
+// it sleeps for the rest, otherwise Sleep(1). The accumulated timeGetTime delta drives game time, so the limit sets
+// the frame rate only. Bytes: cmp ecx, 20 / jae +0x18 / sub eax, esi / add eax, 20.
+std::size_t frame_limiter_rva() noexcept { return sgl::game::patrician2() ? 0xa93e9 : 0xbd1a9; }
 constexpr std::array<std::uint8_t, 10> frame_limiter_original{0x83, 0xf9, 0x14, 0x73, 0x18, 0x2b, 0xc6, 0x83, 0xc0, 0x14};
 constexpr std::size_t frame_limiter_compare = 2;
 constexpr std::size_t frame_limiter_sleep = 9;
 
 bool write_frame_limit(std::uint8_t* base, std::uint8_t milliseconds) noexcept {
-    auto* const code = base + frame_limiter_rva;
+    auto* const code = base + frame_limiter_rva();
     std::array<std::uint8_t, 10> current{};
     std::memcpy(current.data(), code, current.size());
     current[frame_limiter_compare] = current[frame_limiter_sleep] = frame_limiter_original[frame_limiter_compare];
@@ -633,25 +636,52 @@ bool write_frame_limit(std::uint8_t* base, std::uint8_t milliseconds) noexcept {
 }
 }
 
-bool sgl::game_binding_active() noexcept { return game != nullptr; }
+bool sgl::game_binding_active() noexcept { return game_module != nullptr; }
 
 bool sgl::set_game_frame_limit(std::optional<unsigned> max_fps) noexcept {
-    if (!game) return true;
+    // Patrician II has no game binding; write_frame_limit checks the limiter bytes of the running executable.
+    auto* const base = sgl::game::patrician2() ? reinterpret_cast<std::uint8_t*>(GetModuleHandleW(nullptr)) : game_module;
+    if (!base) return true;
     std::uint8_t milliseconds = frame_limiter_original[frame_limiter_compare];
     if (max_fps) {
         if (*max_fps != 0 && (*max_fps < 10 || *max_fps > 1000)) return false;
         milliseconds = *max_fps ? static_cast<std::uint8_t>((1000u + *max_fps / 2) / *max_fps) : 0;
     }
-    return write_frame_limit(game, milliseconds);
+    return write_frame_limit(base, milliseconds);
+}
+
+bool sgl::game_owns_layout() noexcept {
+    static int state = -1;
+    if (state < 0) {
+        // Read once: the size the game requests stays its own for the whole session.
+        bool from_game = false;
+        try { from_game = display_size_from_game(display_config_path()); }
+        catch (...) { }
+        state = sgl::game::executable() != sgl::game::Executable::Other && from_game ? 1 : 0;
+    }
+    return state == 1;
 }
 
 bool sgl::install_game_resolution(DisplaySize size, std::string& error) {
-    if (game) return game_width == size.width && game_height == size.height;
+    if (game_module && game_owned_layout) return update_game_resolution(size);
+    if (game_module) return game_width == size.width && game_height == size.height;
     std::array<wchar_t, 32768> path{};
     const auto length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
     if (!length || length == path.size()) { error = "Cannot identify the game executable"; return false; }
     const std::filesystem::path executable(path.data());
     auto* base = reinterpret_cast<std::uint8_t*>(GetModuleHandleW(nullptr));
+    if (game_owns_layout()) {
+        if (!is_valid_display_size(size)) {
+            error = "Unsupported display resolution " + std::to_string(size.width) + "x" + std::to_string(size.height);
+            return false;
+        }
+        game_width = size.width;
+        game_height = size.height;
+        accelerated_map_source = size;
+        game_owned_layout = true;
+        game_module = base;
+        return true;
+    }
     if (!verified_executable(executable) || base != reinterpret_cast<void*>(0x400000)) {
         // Offscreen SGL comparison programs do not contain the game's layout code.
         if (_wcsnicmp(executable.filename().c_str(), L"Patrician3", 10) != 0) return true;
@@ -700,7 +730,7 @@ bool sgl::install_game_resolution(DisplaySize size, std::string& error) {
     game_width = size.width;
     game_height = size.height;
     accelerated_map_source = size;
-    game = base;
+    game_module = base;
     for (const auto& patch : patches) {
         if (patch.requires_accelerated_map && !accelerated_map_available) continue;
         if (patch.continuation) *patch.continuation = base + patch.rva + patch.length;
@@ -721,8 +751,9 @@ bool sgl::install_game_resolution(DisplaySize size, std::string& error) {
 }
 
 bool sgl::update_game_resolution(DisplaySize size) noexcept {
-    if (!is_supported_display_size(size)) return false;
-    if (game) {
+    // game_owns_layout, not game_owned_layout: Patrician II never installs the binding that sets the latter.
+    if (game_owns_layout() ? !is_valid_display_size(size) : !is_supported_display_size(size)) return false;
+    if (game_module) {
         game_width = size.width;
         game_height = size.height;
         accelerated_map_source = size;
@@ -751,19 +782,26 @@ void sgl::set_fast_forward_map_source_size(DisplaySize size) noexcept {
 }
 
 void sgl::remove_game_resolution() noexcept {
-    if (!game) return;
-    write_frame_limit(game, frame_limiter_original[frame_limiter_compare]);
+    if (!game_module) return;
+    write_frame_limit(game_module, frame_limiter_original[frame_limiter_compare]);
+    if (game_owned_layout) {
+        // Nothing else was patched; the executable's own wide-screen code must stay intact.
+        game_module = nullptr;
+        game_owned_layout = false;
+        accelerated_map_source = {1280, 1024};
+        return;
+    }
     remove_aim_map_hook();
     DWORD protection = 0, discarded = 0;
-    if (!VirtualProtect(game + patch_start, patch_span, PAGE_EXECUTE_READWRITE, &protection))
+    if (!VirtualProtect(game_module + patch_start, patch_span, PAGE_EXECUTE_READWRITE, &protection))
         sgl::unimplemented("game resolution: cannot restore instructions");
-    for (const auto& patch : patches) std::memcpy(game + patch.rva, patch.original, 5);
-    std::memcpy(game + accelerated_map_width_branch_rva,
+    for (const auto& patch : patches) std::memcpy(game_module + patch.rva, patch.original, 5);
+    std::memcpy(game_module + accelerated_map_width_branch_rva,
         accelerated_map_width_branch_original.data(), accelerated_map_width_branch_original.size());
-    if (!FlushInstructionCache(GetCurrentProcess(), game + patch_start, patch_span) ||
-        !VirtualProtect(game + patch_start, patch_span, protection, &discarded))
+    if (!FlushInstructionCache(GetCurrentProcess(), game_module + patch_start, patch_span) ||
+        !VirtualProtect(game_module + patch_start, patch_span, protection, &discarded))
         sgl::unimplemented("game resolution: cannot finalize restored instructions");
-    game = nullptr;
+    game_module = nullptr;
     accelerated_map_loaded = false;
     original_fast_forward_layout = nullptr;
     accelerated_map_source = {1280, 1024};
@@ -781,7 +819,7 @@ sgl::DisplaySize sgl::pending_game_resolution() noexcept {
 }
 
 void sgl::adapt_game_chrome(const char* name, DecodedImage& image, DisplaySize size) {
-    if (!game || !name) return;
+    if (!game_module || game_owned_layout || !name) return;
     if (_stricmp(name, "images/HauptscreenE1280.bmp") == 0) {
         if (image.width != 284 || image.height != 424)
             sgl::unimplemented("game resolution: unexpected original sidebar dimensions");

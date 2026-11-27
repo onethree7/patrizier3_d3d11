@@ -22,12 +22,17 @@ constexpr bool fast_forward_map_layout_matches(FastForwardMapLayoutState state,
         state.frame_width == source.width && state.frame_height == source.height;
 }
 
+// True for Patrician II or III when high_res.ini sets width or height to 0 (or leaves them out): the executable is
+// patched to lay out every screen size itself, so the renderer accepts any valid size the game requests and installs
+// no layout, options or map hooks.
+bool game_owns_layout() noexcept;
 bool install_game_resolution(DisplaySize size, std::string& error);
 bool update_game_resolution(DisplaySize size) noexcept;
 bool refresh_accelerated_map_layout() noexcept;
 void remove_game_resolution() noexcept;
 // Rewrites the minimum frame time of the game's frame limiter (FUN_004bd180, originally 20 ms). No value restores
-// the original limiter. Requires an installed game resolution binding; a no-op for programs without one.
+// the original limiter. Patrician III requires an installed game resolution binding and is a no-op without one;
+// Patrician II rewrites the running executable's limiter (FUN_004a93c0) after checking its bytes.
 bool set_game_frame_limit(std::optional<unsigned> max_fps) noexcept;
 // True while the verified GOG executable's in-memory bindings are installed.
 bool game_binding_active() noexcept;

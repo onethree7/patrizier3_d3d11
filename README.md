@@ -23,11 +23,20 @@ Before launching, move the modloader’s `high_res.dll` out of the `mods` folder
 
 </details>
 
+<details>
+<summary>Playing Patrician II?</summary>
+
+The same `ddraw_Dll.dll` also runs *Patrician II* (`Patrician 2.exe`). Install it into that game’s folder the same way, then set `width=0` and `height=0` in `high_res.ini`.
+
+</details>
+
 Start the game and choose your resolution in the game options. The main menu stays centred. Enter a city to see the wider view.
 
 ## Settings
 
 **For resolution changes, use the in-game options.** Choose **1280×1024**, **1600×900**, **1920×1080**, or **2560×1440**. The game saves your choice for the next launch.
+
+If your game executable is patched to lay out wide screens itself, set `width=0` and `height=0` in `high_res.ini`. The renderer then leaves the game’s screen layout alone and renders at the size the game requests.
 
 For window and frame-rate settings, open `high_res.ini` in the game folder with Notepad. Find the setting you want to change under `[display]`, edit its value, and save the file.
 
@@ -36,8 +45,12 @@ For window and frame-rate settings, open `high_res.ini` in the game folder with 
 | Fill the screen with a borderless window (default) | `mode=borderless` |
 | Use a window you can move and resize | `mode=windowed` |
 | Remove the frame-rate limit | `max_fps=0` |
+| Wait for the screen refresh on every frame for even pacing (default) | `vsync=1` |
+| Stop waiting for the screen refresh, so only `max_fps` limits the frame rate | `vsync=0` |
 | Show the frame counter in the top-left corner | `show_fps=1` |
 | Hide the frame counter | `show_fps=0` |
+| Blend translucent images exactly like the original (default) | `exact_blend=1` |
+| Use faster hardware blending, at most one colour step off, for example on Apple Silicon | `exact_blend=0` |
 
 You can set a frame-rate limit between `10` and `1000`. If the `max_fps` line is missing, the game uses its original 50 FPS limit.
 

@@ -1,10 +1,15 @@
 #include "surface_renderer.hpp"
+
+#include "build_config.hpp"
+#include <dxgi.h>
 #include <algorithm>
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <functional>
+#include <iterator>
 #include <new>
 #include <stdexcept>
 #include <vector>
@@ -53,11 +58,30 @@ HRESULT SurfaceRenderer::initialize() noexcept {
     if (device_) return S_OK;
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
-    HRESULT result = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-        nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, &context);
-    if (FAILED(result)) return result;
+    // The shaders need feature level 10_0. Wine translates D3D11 to OpenGL (wined3d) or Vulkan (DXVK, wined3d
+    // with renderer=vulkan); some of those reject a request without a level list or the hardware driver type.
+    static constexpr D3D_FEATURE_LEVEL levels[] = {
+        D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
+    HRESULT result = E_FAIL;
+    for (const D3D_DRIVER_TYPE type : {D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_WARP}) {
+        ComPtr<IDXGIFactory1> factory;
+        ComPtr<IDXGIAdapter1> adapter;
+        if (type == D3D_DRIVER_TYPE_UNKNOWN) {
+            // Explicit first adapter: needed by some layers that do not map a null adapter.
+            if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) || FAILED(factory->EnumAdapters1(0, &adapter)))
+                continue;
+        }
+        result = D3D11CreateDevice(adapter.Get(), type, nullptr, 0, levels, static_cast<UINT>(std::size(levels)),
+            D3D11_SDK_VERSION, &device, nullptr, &context);
+        if (SUCCEEDED(result)) break;
+    }
+    if (FAILED(result)) { init_failure_stage_ = "creating the Direct3D 11 device (feature level 10_0 or higher)"; return result; }
     result = compositor_.initialize(device.Get());
-    if (FAILED(result)) return result;
+    if (FAILED(result)) {
+        init_failure_stage_ = result == HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND) ?
+            "loading d3dcompiler_47/46/43.dll" : "compiling or creating the shaders";
+        return result;
+    }
     device_ = device;
     context_ = context;
     return S_OK;
@@ -220,6 +244,12 @@ HRESULT SurfaceRenderer::draw(void* source_id, const DecodedImage& source, void*
         target_rect, clip, key, blend, failure_stage, modulation_color, sampling);
 }
 
+HRESULT SurfaceRenderer::copy_within(void* id, DecodedImage& image, Rect source_rect, Rect target_rect, RECT clip,
+    const char** failure_stage) noexcept {
+    return draw_impl(id, image, nullptr, nullptr, id, image, source_rect, target_rect, clip, std::nullopt,
+        BlendMode::Opaque, failure_stage, 0xffffffff, Sampling::SglFixedPoint, true);
+}
+
 HRESULT SurfaceRenderer::draw_masked(void* source_id, const DecodedImage& source, void* mask_id,
     const DecodedImage& mask, void* target_id, DecodedImage& target, Rect source_rect,
     Rect target_rect, RECT clip, std::uint32_t modulation_color, const char** failure_stage) noexcept {
@@ -230,9 +260,11 @@ HRESULT SurfaceRenderer::draw_masked(void* source_id, const DecodedImage& source
 HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, void* mask_id,
     const DecodedImage* mask, void* target_id, DecodedImage& target, Rect source_rect,
     Rect target_rect, RECT clip, std::optional<std::uint32_t> key, BlendMode blend,
-    const char** failure_stage, std::uint32_t modulation_color, Sampling sampling) noexcept {
+    const char** failure_stage, std::uint32_t modulation_color, Sampling sampling, bool self_copy) noexcept {
     if (failure_stage) *failure_stage = "argument validation";
-    if (!source_id || !target_id || source_id == target_id ||
+    if (!source_id || !target_id ||
+        (self_copy ? source_id != target_id || mask || blend != BlendMode::Opaque || key.has_value() :
+            source_id == target_id) ||
         (mask && mask_id == target_id) ||
         ((mask == nullptr) != (mask_id == nullptr)) ||
         ((blend == BlendMode::AlphaMask) != (mask != nullptr)) ||
@@ -275,7 +307,7 @@ HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, 
     if (pending_target_ && pending_target_ != dst->texture.Get()) flush_pending();
     // The last recorded draw leaves its target bound. Unbind it only when this draw reads it; binding a bound render
     // target as a shader resource would silently null the input, while re-binding per draw costs driver time.
-    if (bound_target_ && (bound_target_ == src->texture.Get() || (mask && bound_target_ == mask_surface->texture.Get()))) {
+    if (!self_copy && bound_target_ && (bound_target_ == src->texture.Get() || (mask && bound_target_ == mask_surface->texture.Get()))) {
         context_->OMSetRenderTargets(0, nullptr, nullptr);
         bound_target_ = nullptr;
         compositor_.invalidate_renderer_bindings();
@@ -291,6 +323,39 @@ HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, 
     if (failure_stage) *failure_stage = "destination texture upload";
     hr = upload_cpu_image(*dst, target);
     if (FAILED(hr)) return hr;
+    if (self_copy) {
+        if (!dst->snapshot) {
+            if (failure_stage) *failure_stage = "self-copy snapshot allocation";
+            D3D11_TEXTURE2D_DESC desc = dst->description;
+            desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            ComPtr<ID3D11Texture2D> snapshot;
+            ComPtr<ID3D11ShaderResourceView> view;
+            hr = device_->CreateTexture2D(&desc, nullptr, &snapshot);
+            if (FAILED(hr)) return hr;
+            hr = device_->CreateShaderResourceView(snapshot.Get(), nullptr, &view);
+            if (FAILED(hr)) return hr;
+            dst->snapshot = snapshot;
+            dst->snapshot_view = view;
+        }
+        // Queued draws to this surface come before the copy; a queued draw reading the snapshot does not exist
+        // because every self-copy flushes here first. The box covers the sampled pixels plus a filtering margin.
+        flush_pending();
+        const LONG surface_width = static_cast<LONG>(dst->description.Width);
+        const LONG surface_height = static_cast<LONG>(dst->description.Height);
+        const auto edge = [](float value, LONG offset, LONG high) {
+            return std::clamp(static_cast<LONG>(std::clamp(std::floor(value), -1.0e9f, 1.0e9f)) + offset, 0L, high);
+        };
+        const LONG left = edge(std::min(source_rect.left, source_rect.right), -2, surface_width);
+        const LONG top = edge(std::min(source_rect.top, source_rect.bottom), -2, surface_height);
+        const LONG right = edge(std::max(source_rect.left, source_rect.right), 3, surface_width);
+        const LONG bottom = edge(std::max(source_rect.top, source_rect.bottom), 3, surface_height);
+        if (left < right && top < bottom) {
+            const D3D11_BOX box{static_cast<UINT>(left), static_cast<UINT>(top), 0,
+                static_cast<UINT>(right), static_cast<UINT>(bottom), 1};
+            context_->CopySubresourceRegion(dst->snapshot.Get(), 0, box.left, box.top, 0, dst->texture.Get(), 0, &box);
+        }
+    }
+    ID3D11ShaderResourceView* const source_view = self_copy ? dst->snapshot_view.Get() : src->view.Get();
     const LONG width = static_cast<LONG>(target.width), height = static_cast<LONG>(target.height);
     const auto bound = [](float value, LONG low, LONG high, bool up) {
         const float rounded = up ? std::ceil(value) : std::floor(value);
@@ -302,7 +367,9 @@ HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, 
         std::min(bound(target_rect.right, 0, width, true), std::clamp<LONG>(clip.right, 0, width)),
         std::min(bound(target_rect.bottom, 0, height, true), std::clamp<LONG>(clip.bottom, 0, height))};
     const bool writes = written.left < written.right && written.top < written.bottom;
-    if (blend != BlendMode::Opaque) {
+    // Only exact blending reads the target through a background copy; hardware blending reads it in place.
+    const bool copies_background = blend != BlendMode::Opaque && exact_blend_;
+    if (copies_background) {
         if (failure_stage) *failure_stage = "alpha background allocation";
         hr = create_background(*dst);
         if (FAILED(hr)) return hr;
@@ -312,22 +379,22 @@ HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, 
         source.format == ImageFormat::Indexed8 ? DXGI_FORMAT_R8_UINT : DXGI_FORMAT_B8G8R8A8_UNORM};
     PendingDraw pending;
     if (mask) {
-        hr = compositor_.prepare(context_.Get(), dst->target.Get(), src->view.Get(),
+        hr = compositor_.prepare(context_.Get(), dst->target.Get(), source_view,
             src->palette_view.Get(), mask_surface->view.Get(), target.width, target.height,
             source_rect, target_rect, clip, std::nullopt, Sampling::SglFixedPoint,
-            dst->background_view.Get(), modulation_color, BlendMode::AlphaMask, failure_stage, &renderer_source,
-            pending.draw);
+            copies_background ? dst->background_view.Get() : nullptr, modulation_color, BlendMode::AlphaMask,
+            failure_stage, &renderer_source, pending.draw);
     } else {
-        hr = compositor_.prepare(context_.Get(), dst->target.Get(), src->view.Get(),
+        hr = compositor_.prepare(context_.Get(), dst->target.Get(), source_view,
             source.format == ImageFormat::Indexed8 ? src->palette_view.Get() : nullptr, nullptr,
             target.width, target.height, source_rect, target_rect, clip, key, sampling,
-            blend != BlendMode::Opaque ? dst->background_view.Get() : nullptr,
+            copies_background ? dst->background_view.Get() : nullptr,
             modulation_color, blend, failure_stage, &renderer_source, pending.draw);
     }
     if (FAILED(hr)) return hr;
     ++counters_.draws;
     if (pending.draw.visible) {
-        if (blend != BlendMode::Opaque && writes) {
+        if (copies_background && writes) {
             pending.background = dst->background.Get();
             pending.copy = {static_cast<UINT>(written.left), static_cast<UINT>(written.top), 0,
                 static_cast<UINT>(written.right), static_cast<UINT>(written.bottom), 1};
@@ -395,6 +462,8 @@ void SurfaceRenderer::flush_pending() noexcept {
             const auto& a = pending_[left].draw;
             const auto& b = pending_[right].draw;
             if (a.pixel_shader != b.pixel_shader) return std::less<>()(a.pixel_shader, b.pixel_shader);
+            if (a.blend_state != b.blend_state) return std::less<>()(a.blend_state, b.blend_state);
+            if (a.blend_factor != b.blend_factor) return a.blend_factor < b.blend_factor;
             if (const int order = std::memcmp(a.resources, b.resources, sizeof(a.resources))) return order < 0;
             if (a.clip_in_shader != b.clip_in_shader) return a.clip_in_shader < b.clip_in_shader;
             if (const int order = std::memcmp(&a.clip, &b.clip, sizeof(a.clip))) return order < 0;
@@ -542,10 +611,14 @@ HRESULT SurfaceRenderer::synchronize_to_cpu(void* id, DecodedImage& image) noexc
         }
     }
     context_->Unmap(target.staging.Get(), 0);
+    const unsigned long long bytes = static_cast<unsigned long long>(columns) * 4 *
+        static_cast<unsigned long long>(dirty.bottom - dirty.top);
+    const long long ticks = performance_counter() - started;
     ++counters_.readbacks;
-    counters_.transfer_bytes += static_cast<unsigned long long>(columns) * 4 * static_cast<unsigned long long>(dirty.bottom - dirty.top);
+    counters_.transfer_bytes += bytes;
     target.gpu_dirty = {};
-    counters_.readback_ticks += performance_counter() - started;
+    counters_.readback_ticks += ticks;
+    trace_readback(target, bytes, ticks);
     target.cpu_needs_upload = false;
     target.cpu_needs_readback = false;
     return S_OK;
@@ -584,9 +657,13 @@ HRESULT SurfaceRenderer::synchronize_region_to_cpu(void* id, DecodedImage& image
                 static_cast<std::size_t>(region.left) * 4, columns);
     }
     context_->Unmap(target.staging.Get(), 0);
+    const unsigned long long bytes = static_cast<unsigned long long>(columns) *
+        static_cast<unsigned long long>(region.bottom - region.top);
+    const long long ticks = performance_counter() - started;
     ++counters_.readbacks;
-    counters_.transfer_bytes += static_cast<unsigned long long>(columns) * static_cast<unsigned long long>(region.bottom - region.top);
-    counters_.readback_ticks += performance_counter() - started;
+    counters_.transfer_bytes += bytes;
+    counters_.readback_ticks += ticks;
+    trace_readback(target, bytes, ticks);
     return S_OK;
 }
 
@@ -639,10 +716,91 @@ void SurfaceRenderer::forget(void* id) noexcept {
     surfaces_.erase(found);
 }
 
-HRESULT SurfaceRenderer::open_screen(HWND window, const std::filesystem::path& config, std::string& error) {
+HRESULT SurfaceRenderer::open_screen(HWND window, const std::filesystem::path& config, std::string& error,
+    std::optional<DisplaySize> game_size) {
     HRESULT hr = initialize();
     if (FAILED(hr)) { error = "Cannot initialize D3D11 device"; return hr; }
-    return presentation_.initialize_configured(device_.Get(), window, config, error);
+    hr = presentation_.initialize_configured(device_.Get(), window, config, error, game_size);
+    if (SUCCEEDED(hr)) set_exact_blend(presentation_.exact_blend());
+    readback_sources_.clear();
+    readback_window_start_ = 0;
+    readback_frames_ = 0;
+    readback_log_.clear();
+    if constexpr (build::diagnostics) {
+        if (SUCCEEDED(hr) && presentation_.show_fps()) {
+            readback_log_ = config.parent_path() / L"sgl_readbacks.log";
+            // Each screen opening starts a fresh log.
+            std::FILE* log = nullptr;
+            if (!_wfopen_s(&log, readback_log_.c_str(), L"w") && log) std::fclose(log);
+        }
+    }
+    return hr;
+}
+
+void SurfaceRenderer::set_exact_blend(bool exact) noexcept {
+    // Queued draws were prepared for the current mode; blended ones carry either a background copy or a blend state.
+    if (exact == exact_blend_) return;
+    flush_pending();
+    exact_blend_ = exact;
+}
+
+void SurfaceRenderer::set_readback_site(const char* site, std::uintptr_t caller) noexcept {
+    readback_site_ = site;
+    readback_caller_ = caller;
+}
+
+void SurfaceRenderer::trace_readback(const Surface& surface, unsigned long long bytes, long long ticks) noexcept {
+    if (readback_log_.empty()) return;
+    const UINT width = surface.description.Width, height = surface.description.Height;
+    auto found = std::find_if(readback_sources_.begin(), readback_sources_.end(), [&](const ReadbackSource& source) {
+        return source.site == readback_site_ && source.caller == readback_caller_ && source.width == width &&
+            source.height == height;
+    });
+    if (found == readback_sources_.end()) {
+        try {
+            readback_sources_.push_back({readback_site_, readback_caller_, width, height});
+        } catch (const std::bad_alloc&) { return; }
+        found = readback_sources_.end() - 1;
+    }
+    ++found->count;
+    found->bytes += bytes;
+    found->ticks += ticks;
+}
+
+void SurfaceRenderer::write_readback_trace() noexcept {
+    if (readback_log_.empty()) return;
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    const long long now = performance_counter();
+    if (!readback_window_start_) {
+        readback_window_start_ = now;
+        readback_frames_ = 0;
+        readback_sources_.clear();
+        return;
+    }
+    ++readback_frames_;
+    if (!frequency.QuadPart || now - readback_window_start_ < 2 * frequency.QuadPart) return;
+    std::sort(readback_sources_.begin(), readback_sources_.end(), [](const ReadbackSource& a, const ReadbackSource& b) {
+        return a.ticks > b.ticks;
+    });
+    std::FILE* log = nullptr;
+    if (!_wfopen_s(&log, readback_log_.c_str(), L"a") && log) {
+        const double frames = readback_frames_;
+        const double tick_ms = 1000.0 / static_cast<double>(frequency.QuadPart);
+        std::fprintf(log, "%u frames in %.2f s\n", readback_frames_,
+            static_cast<double>(now - readback_window_start_) * tick_ms / 1000.0);
+        if (readback_sources_.empty()) std::fprintf(log, "  no readbacks\n");
+        for (const auto& source : readback_sources_) {
+            std::fprintf(log, "  %-20s caller %08x %4ux%-4u %6.2f per frame %7.2f ms per frame %8.1f KiB per frame\n",
+                source.site ? source.site : "(other)", static_cast<unsigned>(source.caller), source.width, source.height,
+                source.count / frames, static_cast<double>(source.ticks) * tick_ms / frames,
+                static_cast<double>(source.bytes) / 1024.0 / frames);
+        }
+        std::fclose(log);
+    }
+    readback_window_start_ = now;
+    readback_frames_ = 0;
+    readback_sources_.clear();
 }
 
 HRESULT SurfaceRenderer::set_screen_size(DisplaySize size) noexcept {
@@ -654,6 +812,8 @@ void SurfaceRenderer::close_screen() noexcept { presentation_.close(); }
 void SurfaceRenderer::shutdown() noexcept {
     pending_.clear();
     pending_target_ = nullptr;
+    readback_sources_.clear();
+    readback_log_.clear();
     if (context_) context_->ClearState();
     bound_target_ = nullptr;
     compositor_.invalidate_renderer_bindings();
@@ -699,6 +859,7 @@ HRESULT SurfaceRenderer::present(void* id, const DecodedImage& image) noexcept {
     if (FAILED(hr)) return hr;
     const FrameCounters counters = counters_;
     counters_ = {};
+    write_readback_trace();
     return presentation_.present(counters);
 }
 

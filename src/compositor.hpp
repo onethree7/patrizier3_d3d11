@@ -18,7 +18,8 @@ struct Rect {
 // straddles a texel edge, so non-integer scale factors keep even pixel widths without blurring.
 enum class Sampling { Center, SglFixedPoint, SglBilinear, PresentSharp };
 // FillAlpha reproduces sgl_FillSolidRect's translucent fill: (source * a >> 8) + (background * (255 - a) >> 8), with a
-// taken from the modulation alpha.
+// taken from the modulation alpha. A blended draw given a background view (a copy of the target) reproduces these integer
+// formulas exactly; without one a hardware blend state combines it with the target, at most one step apart.
 enum class BlendMode { Opaque, Alpha, Multiply, MultiplyModulated, Multiply2, Additive, AdditiveModulated, AlphaMask, FillAlpha };
 
 class Compositor {
@@ -78,6 +79,9 @@ public:
         UINT target_height = 0;
         RECT clip{};
         ID3D11PixelShader* pixel_shader = nullptr;
+        // Null for draws without hardware blending; blend_factor is the constant alpha of a translucent fill.
+        ID3D11BlendState* blend_state = nullptr;
+        std::uint8_t blend_factor = 0xff;
         ID3D11ShaderResourceView* resources[5] = {};
         std::uint8_t constants[112] = {};
         bool visible = false;
@@ -89,6 +93,16 @@ public:
 
 private:
     friend class SurfaceRenderer;
+
+    // Pixel shaders that output the source color for a hardware blend state; the order matches blend_source_entries.
+    enum BlendSource : unsigned {
+        plain_source, plain_indexed_source, tinted_source, keyed_tinted_indexed_source, tinted_indexed_source,
+        rgb_source, rgb_indexed_source, tinted_rgb_source, tinted_rgb_indexed_source, masked_source, blend_source_count
+    };
+    enum HardwareBlend : unsigned {
+        alpha_blend, additive_blend, multiply_blend, multiply2_blend, fill_alpha_blend, alpha_mask_blend, hardware_blend_count
+    };
+    static D3D11_RENDER_TARGET_BLEND_DESC blend_desc(HardwareBlend mode) noexcept;
 
     struct RendererSource {
         UINT width;
@@ -112,7 +126,7 @@ private:
         std::uint32_t modulation_color, BlendMode blend, const char** failure_stage,
         const RendererSource* renderer_source, PreparedDraw& prepared) noexcept;
     // Records prepared draws in order. Their per-draw data goes into the instance buffer with one map, and each run of
-    // neighbouring draws with the same target, pixel shader and resources, and either the same clip or all with
+    // neighbouring draws with the same target, pixel shader, blend state and resources, and either the same clip or all with
     // clip_in_shader, becomes one instanced draw call under the bounding box of their clips.
     // Renderer-owned draws keep their bindings cached between calls; other draws unbind their shader resources
     // afterwards.
@@ -140,6 +154,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D11PixelShader> additive_indexed_shader_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> additive_modulated_indexed_shader_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> alpha_masked_indexed_shader_;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> blend_source_shaders_[blend_source_count];
+    Microsoft::WRL::ComPtr<ID3D11BlendState> blend_states_[hardware_blend_count];
     Microsoft::WRL::ComPtr<ID3D11InputLayout> input_layout_;
     // Per-draw data, one PreparedDraw::constants per instance, filled as a ring and grown on demand.
     Microsoft::WRL::ComPtr<ID3D11Buffer> instances_;
@@ -154,6 +170,10 @@ private:
     ID3D11RenderTargetView* renderer_target_ = nullptr;
     UINT renderer_viewport_width_ = 0;
     UINT renderer_viewport_height_ = 0;
+    // The blend state and factor bound for renderer-owned draws; unknown until renderer_blend_bound_.
+    bool renderer_blend_bound_ = false;
+    ID3D11BlendState* renderer_blend_state_ = nullptr;
+    std::uint8_t renderer_blend_factor_ = 0xff;
     ID3D11ShaderResourceView* renderer_resources_[5] = {};
 
     Microsoft::WRL::ComPtr<ID3D11VertexShader> water_vertex_shader_;

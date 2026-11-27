@@ -300,7 +300,67 @@ float4 alpha_masked_indexed_main(Vertex input) : SV_Target {
     uint index = index_texture.Load(int3(pixel, 0));
     return alpha_mask_blend(palette_texture.Load(int3(index, 0, 0)), mask_alpha, input);
 }
+// Source colors for the hardware blend states, which combine them with the target in place of a background copy.
+int4 tinted(float4 color) {
+    return (int4(round(saturate(color) * 255)) * int4(round(saturate(modulation_color) * 255))) >> 8;
+}
+float4 plain_source_main(Vertex input) : SV_Target {
+    load_draw(input);
+    return sample_pixel(input);
+}
+float4 plain_indexed_source_main(Vertex input) : SV_Target {
+    load_draw(input);
+    return sample_indexed(input);
+}
+float4 tinted_source_main(Vertex input) : SV_Target {
+    load_draw(input);
+    return float4(tinted(sample_pixel(input))) / 255.0;
+}
+float4 keyed_tinted_indexed_source_main(Vertex input) : SV_Target {
+    load_draw(input);
+    float4 color = sample_indexed(input);
+    uint3 channels = uint3(round(saturate(color.rgb) * 255));
+    if (color_key != 0xffffffff && ((channels.r << 16) | (channels.g << 8) | channels.b) == (color_key & 0xffffff))
+        discard;
+    return float4(tinted(color)) / 255.0;
+}
+float4 tinted_indexed_source_main(Vertex input) : SV_Target {
+    load_draw(input);
+    return float4(tinted(sample_indexed(input))) / 255.0;
+}
+float4 rgb_source_main(Vertex input) : SV_Target {
+    load_draw(input);
+    return float4(sample_pixel(input).rgb, 1);
+}
+float4 rgb_indexed_source_main(Vertex input) : SV_Target {
+    load_draw(input);
+    return float4(sample_indexed(input).rgb, 1);
+}
+float4 tinted_rgb_source_main(Vertex input) : SV_Target {
+    load_draw(input);
+    return float4(float3(tinted(sample_pixel(input)).rgb) / 255.0, 1);
+}
+float4 tinted_rgb_indexed_source_main(Vertex input) : SV_Target {
+    load_draw(input);
+    return float4(float3(tinted(sample_indexed(input)).rgb) / 255.0, 1);
+}
+float4 masked_source_main(Vertex input) : SV_Target {
+    load_draw(input);
+    uint2 pixel = indexed_pixel(input);
+    uint mask_alpha = alpha_mask_texture.Load(int3(pixel, 0));
+    if (mask_alpha == 0) discard;
+    uint index = index_texture.Load(int3(pixel, 0));
+    int4 tint = int4(round(saturate(modulation_color) * 255));
+    int3 source = (int3(round(saturate(palette_texture.Load(int3(index, 0, 0)).rgb) * 255)) * tint.rgb) >> 8;
+    return float4(float3(source) / 255.0, float((int(mask_alpha) * tint.a) >> 8) / 255.0);
+}
 )";
+
+// Entry points of the hardware blend sources, in Compositor::BlendSource order.
+constexpr const char* blend_source_entries[] = {
+    "plain_source_main", "plain_indexed_source_main", "tinted_source_main", "keyed_tinted_indexed_source_main",
+    "tinted_indexed_source_main", "rgb_source_main", "rgb_indexed_source_main", "tinted_rgb_source_main",
+    "tinted_rgb_indexed_source_main", "masked_source_main"};
 
 struct alignas(16) Geometry {
     float destination[4];
@@ -411,10 +471,72 @@ bool valid_rect(sgl::Rect rect) noexcept {
 
 namespace sgl {
 
+// D3DCompile is resolved at run time instead of imported: a missing d3dcompiler_47.dll (some Wine/Proton
+// prefixes) would otherwise stop the game from loading this library at all. Any of these versions compiles
+// the shaders below (shader model 4.0).
+static pD3DCompile d3d_compile_function() noexcept {
+    static const pD3DCompile function = [] {
+        for (const wchar_t* name : {L"d3dcompiler_47.dll", L"d3dcompiler_46.dll", L"d3dcompiler_43.dll"}) {
+            const HMODULE module = LoadLibraryW(name);
+            if (!module) continue;
+            if (const auto found = reinterpret_cast<pD3DCompile>(GetProcAddress(module, "D3DCompile"))) return found;
+            FreeLibrary(module);
+        }
+        return pD3DCompile{};
+    }();
+    return function;
+}
+
+// Render target blend of a hardware blend state. The fixed-function equations stand in for the integer formulas of the
+// background-copy shaders and may differ from them by one step.
+D3D11_RENDER_TARGET_BLEND_DESC Compositor::blend_desc(HardwareBlend mode) noexcept {
+    D3D11_RENDER_TARGET_BLEND_DESC desc = {};
+    desc.BlendEnable = TRUE;
+    desc.BlendOp = desc.BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    desc.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    switch (mode) {
+    case alpha_blend: // source and destination mixed by the source alpha in all four channels
+        desc.SrcBlend = desc.SrcBlendAlpha = D3D11_BLEND_SRC_ALPHA;
+        desc.DestBlend = desc.DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+        break;
+    case additive_blend: // saturated sum, alpha set by the source's 1
+        desc.SrcBlend = desc.DestBlend = desc.SrcBlendAlpha = D3D11_BLEND_ONE;
+        desc.DestBlendAlpha = D3D11_BLEND_ZERO;
+        break;
+    case multiply_blend: // source times destination in all four channels
+        desc.SrcBlend = D3D11_BLEND_DEST_COLOR;
+        desc.SrcBlendAlpha = D3D11_BLEND_DEST_ALPHA;
+        desc.DestBlend = desc.DestBlendAlpha = D3D11_BLEND_ZERO;
+        break;
+    case multiply2_blend: // source * destination + destination * source, saturated
+        desc.SrcBlend = D3D11_BLEND_DEST_COLOR;
+        desc.DestBlend = D3D11_BLEND_SRC_COLOR;
+        desc.SrcBlendAlpha = D3D11_BLEND_DEST_ALPHA;
+        desc.DestBlendAlpha = D3D11_BLEND_SRC_ALPHA;
+        break;
+    case fill_alpha_blend: // color mixed by the draw's constant alpha (the blend factor), alpha set by the source's 1
+        desc.SrcBlend = D3D11_BLEND_BLEND_FACTOR;
+        desc.DestBlend = D3D11_BLEND_INV_BLEND_FACTOR;
+        desc.SrcBlendAlpha = D3D11_BLEND_ONE;
+        desc.DestBlendAlpha = D3D11_BLEND_ZERO;
+        break;
+    case alpha_mask_blend:
+    default: // color mixed by the mask opacity; the target alpha is kept
+        desc.SrcBlend = desc.SrcBlendAlpha = D3D11_BLEND_SRC_ALPHA;
+        desc.DestBlend = desc.DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+        desc.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN |
+            D3D11_COLOR_WRITE_ENABLE_BLUE;
+        break;
+    }
+    return desc;
+}
+
 HRESULT Compositor::initialize(ID3D11Device* device) noexcept {
     renderer_state_context_ = nullptr;
     renderer_pixel_shader_ = nullptr;
     if (!device) return E_INVALIDARG;
+    const pD3DCompile compile = d3d_compile_function();
+    if (!compile) return HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND);
     ComPtr<ID3DBlob> vertex_code;
     ComPtr<ID3DBlob> pixel_code;
     ComPtr<ID3DBlob> keyed_pixel_code;
@@ -455,58 +577,61 @@ HRESULT Compositor::initialize(ID3D11Device* device) noexcept {
     ComPtr<ID3D11SamplerState> sampler_state;
     ComPtr<ID3D11SamplerState> present_sampler_state;
     ComPtr<ID3D11RasterizerState> rasterizer_state;
-    HRESULT result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    ComPtr<ID3D11PixelShader> blend_source_shaders[blend_source_count];
+    ComPtr<ID3D11BlendState> blend_states[hardware_blend_count];
+    static_assert(std::size(blend_source_entries) == blend_source_count);
+    HRESULT result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "vertex_main", "vs_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &vertex_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "pixel_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &pixel_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "keyed_pixel_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &keyed_pixel_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "alpha_pixel_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &alpha_pixel_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "multiply_pixel_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &multiply_pixel_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "multiply_modulated_pixel_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &multiply_modulated_pixel_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "multiply2_pixel_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &multiply2_pixel_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "fill_alpha_pixel_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &fill_alpha_pixel_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "additive_pixel_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &additive_pixel_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "additive_modulated_pixel_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &additive_modulated_pixel_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "indexed_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &indexed_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "keyed_indexed_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &keyed_indexed_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "alpha_indexed_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &alpha_indexed_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "multiply_indexed_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &multiply_indexed_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "multiply_modulated_indexed_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &multiply_modulated_indexed_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "additive_indexed_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &additive_indexed_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "additive_modulated_indexed_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &additive_modulated_indexed_code, nullptr);
     if (FAILED(result)) return result;
-    result = D3DCompile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
         "alpha_masked_indexed_main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &alpha_masked_indexed_code, nullptr);
     if (FAILED(result)) return result;
     result = device->CreateVertexShader(vertex_code->GetBufferPointer(), vertex_code->GetBufferSize(),
@@ -563,6 +688,21 @@ HRESULT Compositor::initialize(ID3D11Device* device) noexcept {
     result = device->CreatePixelShader(additive_modulated_pixel_code->GetBufferPointer(), additive_modulated_pixel_code->GetBufferSize(),
         nullptr, &additive_modulated_pixel_shader);
     if (FAILED(result)) return result;
+    for (unsigned index = 0; index < blend_source_count; ++index) {
+        ComPtr<ID3DBlob> code;
+        result = compile(shader, sizeof(shader) - 1, nullptr, nullptr, nullptr,
+            blend_source_entries[index], "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &code, nullptr);
+        if (FAILED(result)) return result;
+        result = device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr,
+            &blend_source_shaders[index]);
+        if (FAILED(result)) return result;
+    }
+    for (unsigned index = 0; index < hardware_blend_count; ++index) {
+        D3D11_BLEND_DESC blend = {};
+        blend.RenderTarget[0] = blend_desc(static_cast<HardwareBlend>(index));
+        result = device->CreateBlendState(&blend, &blend_states[index]);
+        if (FAILED(result)) return result;
+    }
     // The instance attributes of vertex_main, laid out as Geometry.
     const D3D11_INPUT_ELEMENT_DESC instance_elements[] = {
         {"DESTINATION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, offsetof(Geometry, destination), D3D11_INPUT_PER_INSTANCE_DATA, 1},
@@ -602,7 +742,7 @@ HRESULT Compositor::initialize(ID3D11Device* device) noexcept {
     ComPtr<ID3D11PixelShader> water_pixel_shaders[4];
     ComPtr<ID3D11BlendState> water_blend_state;
     ComPtr<ID3D11Buffer> water_constants;
-    result = D3DCompile(water_shader, sizeof(water_shader) - 1, nullptr, nullptr, nullptr,
+    result = compile(water_shader, sizeof(water_shader) - 1, nullptr, nullptr, nullptr,
         "water_vertex", "vs_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &water_vertex_code, nullptr);
     if (FAILED(result)) return result;
     result = device->CreateVertexShader(water_vertex_code->GetBufferPointer(), water_vertex_code->GetBufferSize(),
@@ -611,7 +751,7 @@ HRESULT Compositor::initialize(ID3D11Device* device) noexcept {
     constexpr const char* water_entries[4] = {"water_order", "water_start", "water_jump", "water_finish"};
     for (int index = 0; index < 4; ++index) {
         ComPtr<ID3DBlob> code;
-        result = D3DCompile(water_shader, sizeof(water_shader) - 1, nullptr, nullptr, nullptr,
+        result = compile(water_shader, sizeof(water_shader) - 1, nullptr, nullptr, nullptr,
             water_entries[index], "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &code, nullptr);
         if (FAILED(result)) return result;
         result = device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr,
@@ -661,6 +801,8 @@ HRESULT Compositor::initialize(ID3D11Device* device) noexcept {
     additive_indexed_shader_ = additive_indexed_shader;
     additive_modulated_indexed_shader_ = additive_modulated_indexed_shader;
     alpha_masked_indexed_shader_ = alpha_masked_indexed_shader;
+    std::copy(std::begin(blend_source_shaders), std::end(blend_source_shaders), std::begin(blend_source_shaders_));
+    std::copy(std::begin(blend_states), std::end(blend_states), std::begin(blend_states_));
     input_layout_ = input_layout;
     instances_.Reset();
     instance_capacity_ = instance_next_ = 0;
@@ -740,7 +882,8 @@ HRESULT Compositor::prepare(ID3D11DeviceContext* context, ID3D11RenderTargetView
         !alpha_pixel_shader_ || !multiply_pixel_shader_ || !multiply_modulated_pixel_shader_ || !multiply2_pixel_shader_ || !fill_alpha_pixel_shader_ ||
         !additive_pixel_shader_ || !additive_modulated_pixel_shader_ || !input_layout_ || !indexed_shader_ || !keyed_indexed_shader_ ||
         !alpha_indexed_shader_ || !multiply_indexed_shader_ || !multiply_modulated_indexed_shader_ || !additive_indexed_shader_ ||
-        !additive_modulated_indexed_shader_ || !alpha_masked_indexed_shader_ || !sampler_ || !present_sampler_ || !rasterizer_ || !target_width || !target_height ||
+        !additive_modulated_indexed_shader_ || !alpha_masked_indexed_shader_ || !sampler_ || !present_sampler_ || !rasterizer_ ||
+        !blend_source_shaders_[masked_source] || !blend_states_[alpha_mask_blend] || !target_width || !target_height ||
         !valid_rect(source_rect) || !valid_rect(destination_rect)) return fail("compositor invalid/null inputs or rectangles", E_INVALIDARG);
     if (blend != BlendMode::Opaque && blend != BlendMode::Alpha && blend != BlendMode::Multiply &&
         blend != BlendMode::MultiplyModulated && blend != BlendMode::Multiply2 &&
@@ -748,7 +891,9 @@ HRESULT Compositor::prepare(ID3D11DeviceContext* context, ID3D11RenderTargetView
         blend != BlendMode::FillAlpha)
         return fail("unsupported compositor blend mode", E_INVALIDARG);
     if (blend == BlendMode::FillAlpha && palette) return fail("fill blend requires a BGRA source", E_INVALIDARG);
-    if ((blend == BlendMode::Opaque) != (background == nullptr) ||
+    // A blended draw with a background view reads the target's earlier pixels from it and reproduces the original
+    // integer formulas; without one, a hardware blend state combines the draw with the target.
+    if ((blend == BlendMode::Opaque && background) ||
         (blend != BlendMode::Opaque && color_key && !(palette && blend == BlendMode::Alpha)) ||
         (blend != BlendMode::Opaque && palette && blend != BlendMode::Alpha && blend != BlendMode::Multiply &&
             blend != BlendMode::MultiplyModulated && blend != BlendMode::Additive && blend != BlendMode::AdditiveModulated &&
@@ -971,6 +1116,48 @@ HRESULT Compositor::prepare(ID3D11DeviceContext* context, ID3D11RenderTargetView
         blend == BlendMode::AdditiveModulated ? additive_modulated_pixel_shader_.Get() :
         blend == BlendMode::Additive ? additive_pixel_shader_.Get() :
         color_key ? keyed_pixel_shader_.Get() : pixel_shader_.Get();
+    ID3D11BlendState* blend_state = nullptr;
+    std::uint8_t blend_factor = 0xff;
+    if (blend != BlendMode::Opaque && !background) {
+        BlendSource source_kind = plain_source;
+        HardwareBlend state = alpha_blend;
+        switch (blend) {
+        case BlendMode::Alpha:
+            source_kind = palette ? keyed_tinted_indexed_source : tinted_source;
+            break;
+        case BlendMode::Multiply:
+            source_kind = palette ? plain_indexed_source : plain_source;
+            state = multiply_blend;
+            break;
+        case BlendMode::MultiplyModulated:
+            source_kind = palette ? tinted_indexed_source : tinted_source;
+            state = multiply_blend;
+            break;
+        case BlendMode::Multiply2:
+            state = multiply2_blend;
+            break;
+        case BlendMode::Additive:
+            source_kind = palette ? rgb_indexed_source : rgb_source;
+            state = additive_blend;
+            break;
+        case BlendMode::AdditiveModulated:
+            source_kind = palette ? tinted_rgb_indexed_source : tinted_rgb_source;
+            state = additive_blend;
+            break;
+        case BlendMode::FillAlpha:
+            source_kind = rgb_source;
+            state = fill_alpha_blend;
+            blend_factor = static_cast<std::uint8_t>(modulation_color >> 24);
+            break;
+        case BlendMode::AlphaMask:
+        default:
+            source_kind = masked_source;
+            state = alpha_mask_blend;
+            break;
+        }
+        pixel_shader = blend_source_shaders_[source_kind].Get();
+        blend_state = blend_states_[state].Get();
+    }
     static_assert(sizeof(Geometry) == sizeof(prepared.constants));
     std::memcpy(prepared.constants, &geometry, sizeof(geometry));
     prepared.target = target;
@@ -978,6 +1165,8 @@ HRESULT Compositor::prepare(ID3D11DeviceContext* context, ID3D11RenderTargetView
     prepared.target_height = target_height;
     prepared.clip = clip;
     prepared.pixel_shader = pixel_shader;
+    prepared.blend_state = blend_state;
+    prepared.blend_factor = blend_factor;
     ID3D11ShaderResourceView* const resources[] = {palette ? nullptr : source, palette ? source : nullptr, palette, background, mask};
     std::memcpy(prepared.resources, resources, sizeof(resources));
     prepared.visible = true;
@@ -1037,10 +1226,14 @@ void Compositor::record(ID3D11DeviceContext* context, const PreparedDraw* const*
         renderer_pixel_shader_ = nullptr;
         renderer_target_ = nullptr;
         renderer_viewport_width_ = renderer_viewport_height_ = 0;
+        renderer_blend_bound_ = true;
+        renderer_blend_state_ = nullptr;
+        renderer_blend_factor_ = 0xff;
     }
     const auto same_run = [](const PreparedDraw& first_draw, const PreparedDraw& next) {
         return next.target == first_draw.target && next.target_width == first_draw.target_width &&
             next.target_height == first_draw.target_height && next.pixel_shader == first_draw.pixel_shader &&
+            next.blend_state == first_draw.blend_state && next.blend_factor == first_draw.blend_factor &&
             // A run of draws without clip_in_shader shares one clip as its scissor, so they never discard.
             ((next.clip_in_shader && first_draw.clip_in_shader) ||
                 (!next.clip_in_shader && !first_draw.clip_in_shader &&
@@ -1071,6 +1264,15 @@ void Compositor::record(ID3D11DeviceContext* context, const PreparedDraw* const*
             renderer_viewport_height_ = prepared.target_height;
         }
         context->RSSetScissorRects(1, &scissor);
+        if (!renderer_blend_bound_ || renderer_blend_state_ != prepared.blend_state ||
+            (prepared.blend_state && renderer_blend_factor_ != prepared.blend_factor)) {
+            const float factor = static_cast<float>(prepared.blend_factor) / 255.0f;
+            const float factors[] = {factor, factor, factor, factor};
+            context->OMSetBlendState(prepared.blend_state, factors, 0xffffffff);
+            renderer_blend_state_ = prepared.blend_state;
+            renderer_blend_factor_ = prepared.blend_factor;
+            renderer_blend_bound_ = true;
+        }
         if (renderer_pixel_shader_ != prepared.pixel_shader) {
             context->PSSetShader(prepared.pixel_shader, nullptr, 0);
             renderer_pixel_shader_ = prepared.pixel_shader;
@@ -1243,6 +1445,7 @@ void Compositor::invalidate_renderer_bindings() noexcept {
     renderer_pixel_shader_ = nullptr;
     renderer_target_ = nullptr;
     renderer_viewport_width_ = renderer_viewport_height_ = 0;
+    renderer_blend_bound_ = false;
     for (auto& resource : renderer_resources_) resource = nullptr;
 }
 
