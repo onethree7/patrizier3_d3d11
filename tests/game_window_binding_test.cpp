@@ -28,8 +28,8 @@ int wmain() {
     RECT placed = {};
     if (!GetWindowRect(window, &placed)) return 3;
     if (!sgl::install_mouse_input_transform(window, 400, 300, 400, 300)) return 4;
-    if (!sgl::install_game_window_binding(window) || !sgl::install_game_window_binding(window) ||
-        sgl::install_game_window_binding(other)) return 5;
+    if (!sgl::install_game_window_binding(window, false) || !sgl::install_game_window_binding(window, false) ||
+        sgl::install_game_window_binding(other, true)) return 5;
 
     int result = 0;
     if (!SetWindowPos(window, HWND_TOPMOST, 0, 0, 640, 480, SWP_NOACTIVATE) || !same_rect(window, placed) ||
@@ -53,6 +53,12 @@ int wmain() {
         else if (actual.x != origin.x + 21 || actual.y != origin.y + 41) result = 14;
     }
 
+    sgl::remove_game_window_binding();
+    if (!result && !sgl::install_game_window_binding(window, true)) result = 16;
+    if (!result && GetForegroundWindow() != window) {
+        SetCapture(window);
+        if (GetCapture() == window) result = 17;
+    }
     sgl::remove_game_window_binding();
     if (have_cursor) SetCursorPos(saved.x, saved.y);
     sgl::remove_mouse_input_transform();

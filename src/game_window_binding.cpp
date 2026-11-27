@@ -14,6 +14,7 @@ using SetCaptureFunction = HWND(WINAPI*)(HWND);
 using SetCursorPosFunction = BOOL(WINAPI*)(int, int);
 
 HWND bound_window = nullptr;
+bool foreground_capture = false;
 SetWindowPosFunction original_set_window_pos = nullptr;
 MoveWindowFunction original_move_window = nullptr;
 SetCaptureFunction original_set_capture = nullptr;
@@ -30,7 +31,8 @@ BOOL WINAPI game_move_window(HWND window, int x, int y, int width, int height, B
 }
 
 HWND WINAPI game_set_capture(HWND window) {
-    if (window && window == bound_window) return GetCapture();
+    if (window && window == bound_window && !(foreground_capture && GetForegroundWindow() == window))
+        return GetCapture();
     return original_set_capture(window);
 }
 
@@ -98,9 +100,10 @@ bool write_slot(void** address, void* value) noexcept {
 
 namespace sgl {
 
-bool install_game_window_binding(HWND window) noexcept {
+bool install_game_window_binding(HWND window, bool keep_foreground_capture) noexcept {
     if (!window || !IsWindow(window)) return false;
     if (bound_window) return bound_window == window;
+    foreground_capture = keep_foreground_capture;
     const HMODULE game = GetModuleHandleW(nullptr);
     if (!game) return false;
     for (auto& slot : slots) {
@@ -127,6 +130,7 @@ void remove_game_window_binding() noexcept {
         slot.address = nullptr;
     }
     bound_window = nullptr;
+    foreground_capture = false;
 }
 
 }
