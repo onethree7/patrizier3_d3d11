@@ -1676,6 +1676,9 @@ extern "C" void __cdecl sgl_PrefetchTexture(void* handle) {
     if (textures.find(handle) == textures.end()) sgl::unimplemented("sgl_PrefetchTexture object");
 }
 
+// The game calls this on Ctrl+S. The original writes the screen to grabs/Grab_<n>.bmp; no screenshot is taken here.
+extern "C" void __cdecl sgl_GrabScreen(int, const char*) {}
+
 extern "C" void* __cdecl sgl_SetRenderSource(void* handle) {
     std::lock_guard<TexturesMutex> lock(textures_mutex);
     handle = screen_alias(handle);
