@@ -1679,6 +1679,12 @@ extern "C" void __cdecl sgl_PrefetchTexture(void* handle) {
 // The game calls this on Ctrl+S. The original writes the screen to grabs/Grab_<n>.bmp; no screenshot is taken here.
 extern "C" void __cdecl sgl_GrabScreen(int, const char*) {}
 
+// The game reports archive and texture failures through this and continues. Like the original, the text is shown in
+// an error box captioned "SGL".
+extern "C" int __cdecl sgl_MessageBox(const char* text) {
+    return MessageBoxA(nullptr, text ? text : "", "SGL", MB_OK | MB_ICONERROR | MB_TASKMODAL);
+}
+
 extern "C" void* __cdecl sgl_SetRenderSource(void* handle) {
     std::lock_guard<TexturesMutex> lock(textures_mutex);
     handle = screen_alias(handle);
