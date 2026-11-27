@@ -2215,8 +2215,43 @@ extern "C" void __cdecl sgl_FillSolidRect(int x, int y, int width, int height) {
     if (modified) surface_renderer.mark_cpu_modified(render_destination);
 }
 
-extern "C" void __cdecl sgl_DrawLine(int, int, int, int) {
-    // The original SGL backend dispatches this export to a `ret 0x10` stub.
+// The original calls the render destination's line method (vtable slot 0x58). For surfaces in memory, the offscreen
+// included, it rounds the end points and draws the line between them, both included, in the constant color, clipped
+// by the active clipper. Patrician III draws its diagonal map lines (routes) with it through 0x4bd680 and Patrician II
+// through its counterpart; horizontal and vertical ones go to sgl_FillSolidRect directly, as in the map editor
+// (0x43a0c0). Here each run of the line's pixels in one row (one column for steep lines) is filled as one rectangle.
+extern "C" void __cdecl sgl_DrawLine(float x1, float y1, float x2, float y2) {
+    constexpr float limit = 1 << 24;
+    for (const float value : {x1, y1, x2, y2})
+        if (!std::isfinite(value) || value < -limit || value > limit) return;
+    const long start_x = std::lrint(x1), start_y = std::lrint(y1);
+    const long end_x = std::lrint(x2), end_y = std::lrint(y2);
+    const long dx = end_x > start_x ? end_x - start_x : start_x - end_x;
+    const long dy = end_y > start_y ? start_y - end_y : end_y - start_y;
+    const long step_x = start_x < end_x ? 1 : -1, step_y = start_y < end_y ? 1 : -1;
+    const bool steep = -dy > dx;
+    long error = dx + dy;
+    long x = start_x, y = start_y;
+    RECT run{x, y, x, y};
+    const auto flush = [&run] {
+        sgl_FillSolidRect(run.left, run.top, run.right - run.left + 1, run.bottom - run.top + 1);
+    };
+    while (x != end_x || y != end_y) {
+        const long doubled = 2 * error;
+        long next_x = x, next_y = y;
+        if (doubled >= dy) { error += dy; next_x += step_x; }
+        if (doubled <= dx) { error += dx; next_y += step_y; }
+        if (steep ? next_x == x : next_y == y) {
+            run = {std::min(run.left, next_x), std::min(run.top, next_y),
+                std::max(run.right, next_x), std::max(run.bottom, next_y)};
+        } else {
+            flush();
+            run = {next_x, next_y, next_x, next_y};
+        }
+        x = next_x;
+        y = next_y;
+    }
+    flush();
 }
 
 // The main menu background, drawn only while no game runs.

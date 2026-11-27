@@ -2465,8 +2465,8 @@ int wmain(int argc, wchar_t** argv) {
         return 114;
     }
 
-    const auto original_draw_line = resolve<void (__cdecl*)(int, int, int, int)>(library, "sgl_DrawLine");
-    const auto replacement_draw_line = resolve<void (__cdecl*)(int, int, int, int)>(replacement, "sgl_DrawLine");
+    const auto original_draw_line = resolve<void (__cdecl*)(float, float, float, float)>(library, "sgl_DrawLine");
+    const auto replacement_draw_line = resolve<void (__cdecl*)(float, float, float, float)>(replacement, "sgl_DrawLine");
     if (!original_draw_line || !replacement_draw_line) return 120;
     constexpr std::uint32_t line_background = 0xff29435du;
     constexpr std::uint32_t line_color = 0xffc0712bu;
@@ -2497,8 +2497,10 @@ int wmain(int argc, wchar_t** argv) {
     for (const auto& line : std::array<std::array<int, 4>, 6>{
             std::array<int, 4>{1, 2, 23, 9}, {23, 10, 1, 3}, {3, 21, 11, 1},
             {-7, 5, 39, 18}, {31, 23, 0, 0}, {16, 12, 16, 12}}) {
-        original_draw_line(line[0], line[1], line[2], line[3]);
-        replacement_draw_line(line[0], line[1], line[2], line[3]);
+        original_draw_line(static_cast<float>(line[0]), static_cast<float>(line[1]),
+            static_cast<float>(line[2]), static_cast<float>(line[3]));
+        replacement_draw_line(static_cast<float>(line[0]), static_cast<float>(line[1]),
+            static_cast<float>(line[2]), static_cast<float>(line[3]));
     }
     if (!lock(old_line_target, &old_line_pixels, 1)) return 125;
     unlock(old_line_target);
@@ -2512,8 +2514,8 @@ int wmain(int argc, wchar_t** argv) {
             std::uint32_t old_pixel = 0, new_pixel = 0;
             std::memcpy(&old_pixel, old_line_pixels.pixels + y * old_line_pixels.pitch + x * 4u, 4);
             std::memcpy(&new_pixel, new_line_pixels.pixels + y * new_line_pixels.pitch + x * 4u, 4);
-            if (old_pixel != line_background || new_pixel != old_pixel) {
-                std::fprintf(stderr, "SGL DrawLine no-op differs at (%u,%u): original=%08x replacement=%08x.\n",
+            if (new_pixel != old_pixel) {
+                std::fprintf(stderr, "SGL DrawLine differs at (%u,%u): original=%08x replacement=%08x.\n",
                     x, y, old_pixel, new_pixel);
                 return 124;
             }
@@ -2523,7 +2525,7 @@ int wmain(int argc, wchar_t** argv) {
     replacement_unlock(new_line_target);
     free_image(old_line_target);
     replacement_free(new_line_target);
-    std::puts("SGL DrawLine: original dispatch leaves the destination unchanged for six clipped line cases.");
+    std::puts("SGL DrawLine: original and replacement match for six clipped line cases.");
     std::printf("%s %ux%u source stretch to %ux%u: original and D3D11 replacement match byte-for-byte.\n",
         captured_stretch_source.empty() ? "Synthetic" : "Captured", wide_source_width, wide_source_height,
         wide_target_width, wide_target_height);
