@@ -59,6 +59,7 @@ private:
     bool window_change_in_progress_ = false;
     int revealed_cursor_count_ = 0;
     std::optional<unsigned> max_fps_;
+    bool vsync_ = true;
     bool show_fps_ = false;
     FpsOverlay fps_overlay_;
 };

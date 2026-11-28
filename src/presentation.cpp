@@ -182,6 +182,7 @@ HRESULT Presentation::initialize_configured(ID3D11Device* device, HWND window, c
     const HRESULT hr = initialize(device, window, config.size.width, config.size.height, config.mode);
     if (SUCCEEDED(hr)) {
         max_fps_ = config.max_fps;
+        vsync_ = config.vsync;
         set_show_fps(config.show_fps);
     }
     if (FAILED(hr)) {
@@ -299,6 +300,7 @@ void Presentation::close() noexcept {
     mode_ = DisplayMode::Borderless;
     window_change_in_progress_ = false;
     max_fps_.reset();
+    vsync_ = true;
     show_fps_ = false;
     fps_overlay_.reset();
 }
@@ -480,7 +482,7 @@ HRESULT Presentation::draw(ID3D11DeviceContext* context, Compositor& compositor,
 
 HRESULT Presentation::present(const FrameCounters& counters) noexcept {
     if (!swap_chain_) return E_UNEXPECTED;
-    const HRESULT hr = swap_chain_->Present(1, 0);
+    const HRESULT hr = swap_chain_->Present(vsync_ ? 1 : 0, 0);
     if (SUCCEEDED(hr) && show_fps_) fps_overlay_.frame_presented(counters);
     return hr;
 }

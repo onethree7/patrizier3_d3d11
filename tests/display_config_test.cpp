@@ -41,10 +41,21 @@ int main() {
         "[display]\nwidth=1920\nheight=1080\nmode=windowed\nmode=borderless\n",
         "[display]\nwidth=1920\nheight=1080\nmax_fps=5\n", "[display]\nwidth=1920\nheight=1080\nmax_fps=1001\n",
         "[display]\nwidth=1920\nheight=1080\nmax_fps=\n", "[display]\nwidth=1920\nheight=1080\nshow_fps=yes\n",
-        "[display]\nwidth=1920\nheight=1080\nshow_fps=1\nshow_fps=0\n", "[display]\nwidth=1920\nheight=1080\nmax_fps=60\nmax_fps=60\n"}) {
+        "[display]\nwidth=1920\nheight=1080\nshow_fps=1\nshow_fps=0\n", "[display]\nwidth=1920\nheight=1080\nmax_fps=60\nmax_fps=60\n",
+        "[display]\nwidth=1920\nheight=1080\nvsync=2\n", "[display]\nwidth=1920\nheight=1080\nvsync=\n",
+        "[display]\nwidth=1920\nheight=1080\nvsync=0\nvsync=0\n"}) {
         if (!write(invalid) || sgl::display_config(GetDesktopWindow(), path, config, error) || error.empty()) return 3;
     }
-    if (config.max_fps || config.show_fps) return 22;
+    if (config.max_fps || config.show_fps || !config.vsync) return 22;
+    for (const auto& [text, expected] : std::array<std::pair<const char*, bool>, 2>{{
+        {"[display]\nwidth=1920\nheight=1080\nvsync=0\n", false},
+        {"[display]\nwidth=1920\nheight=1080\nvsync=1\n", true}}}) {
+        if (!write(text) || !sgl::display_config(GetDesktopWindow(), path, config, error) || config.vsync != expected)
+            return 27;
+    }
+    if (!write("[display]\nwidth=1920\nheight=1080\nvsync=0\n") ||
+        !sgl::save_display_config(path, {2560, 1440}, sgl::DisplayMode::Windowed, error) ||
+        !sgl::display_config(GetDesktopWindow(), path, config, error) || config.vsync) return 28;
     if (!write("[display]\nwidth=1920\nheight=1080\nshow_fps=1\n") ||
         !sgl::display_config(GetDesktopWindow(), path, config, error) || !config.show_fps) return 25;
     for (const auto& [text, expected] : std::array<std::pair<const char*, unsigned>, 3>{{

@@ -55,9 +55,21 @@ bool sgl::display_config(HWND window, const std::filesystem::path& path, Display
     } else {
         std::ifstream file(path, std::ios::binary);
         if (!file) { error = "Cannot read high_res.ini"; return false; }
-        bool in_display = false, has_width = false, has_height = false, has_mode = false, has_max_fps = false, has_show_fps = false;
+        bool in_display = false, has_width = false, has_height = false, has_mode = false, has_max_fps = false,
+            has_show_fps = false, has_vsync = false;
         std::string line;
         unsigned line_number = 0;
+        // A 0/1 setting given once.
+        const auto read_flag = [&](std::string_view value, bool& present, bool& flag, const char* name) {
+            if (present) { error = "high_res.ini line " + std::to_string(line_number) + ": duplicate setting"; return false; }
+            present = true;
+            if (value != "0" && value != "1") {
+                error = "high_res.ini line " + std::to_string(line_number) + ": " + name + " must be 0 or 1";
+                return false;
+            }
+            flag = value == "1";
+            return true;
+        };
         while (std::getline(file, line)) {
             ++line_number;
             auto text = trim(line);
@@ -83,10 +95,10 @@ bool sgl::display_config(HWND window, const std::filesystem::path& path, Display
                 else { error = "high_res.ini line " + std::to_string(line_number) + ": mode must be windowed or borderless"; return false; }
                 continue;
             } else if (equal_ascii(key, "show_fps")) {
-                if (has_show_fps) { error = "high_res.ini line " + std::to_string(line_number) + ": duplicate setting"; return false; }
-                has_show_fps = true;
-                if (value == "1") selected.show_fps = true;
-                else if (value != "0") { error = "high_res.ini line " + std::to_string(line_number) + ": show_fps must be 0 or 1"; return false; }
+                if (!read_flag(value, has_show_fps, selected.show_fps, "show_fps")) return false;
+                continue;
+            } else if (equal_ascii(key, "vsync")) {
+                if (!read_flag(value, has_vsync, selected.vsync, "vsync")) return false;
                 continue;
             } else if (equal_ascii(key, "max_fps")) {
                 if (has_max_fps) { error = "high_res.ini line " + std::to_string(line_number) + ": duplicate setting"; return false; }

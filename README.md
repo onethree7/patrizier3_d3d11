@@ -36,10 +36,12 @@ For window and frame-rate settings, open `high_res.ini` in the game folder with 
 | Fill the screen with a borderless window (default) | `mode=borderless` |
 | Use a window you can move and resize | `mode=windowed` |
 | Remove the frame-rate limit | `max_fps=0` |
+| Wait for the screen refresh on every frame (default) | `vsync=1` |
+| Don't wait for the screen refresh, so only `max_fps` limits the frame rate | `vsync=0` |
 | Show the frame counter in the top-left corner | `show_fps=1` |
 | Hide the frame counter | `show_fps=0` |
 
-You can set a frame-rate limit between `10` and `1000`. If the `max_fps` line is missing, the game uses its original 50 FPS limit.
+You can set a frame-rate limit between `10` and `1000`. If the `max_fps` line is missing, the game uses its original 50 FPS limit. In a window, Windows still shows at most one frame per screen refresh with `vsync=0`; with `vsync=0` and `max_fps=0` nothing limits the frame rate.
 
 ## Update or uninstall
 
