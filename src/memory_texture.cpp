@@ -2690,10 +2690,7 @@ static void blit_bitmap(int sx, int sy, int dx, int dy, int width, int height, s
     const std::int64_t bottom = std::min({static_cast<std::int64_t>(height), source_height - sy, target_height - dy});
     if (left >= right || top >= bottom) return;
     if (render_source == render_destination && sx == dx && sy == dy) return;
-    const bool self_copy = render_source == render_destination;
-    if (!lock_texture(src, nullptr, 1, false,
-        self_copy ? LockIntent::CpuPixels : LockIntent::GpuResource))
-        sgl::unimplemented("sgl_Blt source lock");
+    if (!lock_texture(src, nullptr, 1, false, LockIntent::GpuResource)) sgl::unimplemented("sgl_Blt source lock");
     sgl::Rect source_rect{static_cast<float>(sx + left), static_cast<float>(sy + top),
         static_cast<float>(sx + right), static_cast<float>(sy + bottom)};
     sgl::Rect target_rect{static_cast<float>(dx + left), static_cast<float>(dy + top),
@@ -2703,33 +2700,18 @@ static void blit_bitmap(int sx, int sy, int dx, int dy, int width, int height, s
     if (make_screen_transform(render_destination, dst.image, transform)) target_rect = transform.map(target_rect);
     const RECT bounds{0, 0, static_cast<LONG>(dst.image.width), static_cast<LONG>(dst.image.height)};
     const char* failure_stage = nullptr;
-    if (self_copy) {
-        sgl::DecodedImage source_snapshot;
-        try { source_snapshot = src.image; }
-        catch (const std::bad_alloc&) {
-            unlock_texture(src);
-            sgl::unimplemented("sgl_Blt source snapshot allocation");
-        }
-        unlock_texture(src);
-        const HRESULT self_copy_result = surface_renderer.draw(&source_snapshot, source_snapshot,
-            render_destination, dst.image, source_rect, target_rect, bounds, std::nullopt,
-            sgl::BlendMode::Opaque, &failure_stage);
-        surface_renderer.forget(&source_snapshot);
-        if (FAILED(self_copy_result)) {
-            char draw_message[160]{};
-            std::snprintf(draw_message, sizeof(draw_message), "sgl_Blt self-copy D3D11: %s failed (HRESULT 0x%08lX)",
-                failure_stage ? failure_stage : "unknown stage", static_cast<unsigned long>(self_copy_result));
-            sgl::unimplemented(draw_message);
-        }
-        return;
-    }
-    const HRESULT result = surface_renderer.draw(render_source, src.image, render_destination,
-        dst.image, source_rect, target_rect, bounds, std::nullopt, sgl::BlendMode::Opaque, &failure_stage);
+    // Source and destination may overlap in a copy onto the same surface; copy_within reads a GPU snapshot.
+    const bool self_copy = render_source == render_destination;
+    const HRESULT result = self_copy ?
+        surface_renderer.copy_within(render_destination, dst.image, source_rect, target_rect, bounds, &failure_stage) :
+        surface_renderer.draw(render_source, src.image, render_destination, dst.image, source_rect, target_rect, bounds,
+            std::nullopt, sgl::BlendMode::Opaque, &failure_stage);
     unlock_texture(src);
     if (FAILED(result)) {
         char draw_message[160]{};
-        std::snprintf(draw_message, sizeof(draw_message), "sgl_Blt D3D11: %s failed (HRESULT 0x%08lX)",
-            failure_stage ? failure_stage : "unknown stage", static_cast<unsigned long>(result));
+        std::snprintf(draw_message, sizeof(draw_message), "sgl_Blt%s D3D11: %s failed (HRESULT 0x%08lX)",
+            self_copy ? " self-copy" : "", failure_stage ? failure_stage : "unknown stage",
+            static_cast<unsigned long>(result));
         sgl::unimplemented(draw_message);
     }
 }

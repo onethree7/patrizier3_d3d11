@@ -144,18 +144,19 @@ HRESULT SurfaceRenderer::upload_cpu_image(Surface& surface, const DecodedImage& 
     return S_OK;
 }
 
-HRESULT SurfaceRenderer::create_background(Surface& surface) noexcept {
-    if (surface.background) return S_OK;
+HRESULT SurfaceRenderer::create_copy_texture(const Surface& surface, ComPtr<ID3D11Texture2D>& texture,
+    ComPtr<ID3D11ShaderResourceView>& view) noexcept {
+    if (texture) return S_OK;
     D3D11_TEXTURE2D_DESC desc = surface.description;
     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    ComPtr<ID3D11Texture2D> background;
-    ComPtr<ID3D11ShaderResourceView> view;
-    HRESULT hr = device_->CreateTexture2D(&desc, nullptr, &background);
+    ComPtr<ID3D11Texture2D> created;
+    ComPtr<ID3D11ShaderResourceView> created_view;
+    HRESULT hr = device_->CreateTexture2D(&desc, nullptr, &created);
     if (FAILED(hr)) return hr;
-    hr = device_->CreateShaderResourceView(background.Get(), nullptr, &view);
+    hr = device_->CreateShaderResourceView(created.Get(), nullptr, &created_view);
     if (FAILED(hr)) return hr;
-    surface.background = background;
-    surface.background_view = view;
+    texture = created;
+    view = created_view;
     return S_OK;
 }
 
@@ -172,7 +173,7 @@ HRESULT SurfaceRenderer::draw_water(void* id, const DecodedImage& image, const R
     hr = surface(id, image, dst);
     if (FAILED(hr)) return hr;
     if (!dst->target) return E_INVALIDARG;
-    hr = create_background(*dst);
+    hr = create_copy_texture(*dst, dst->background, dst->background_view);
     if (FAILED(hr)) return hr;
     // Queued draws, which may write or read this surface, come before the effect.
     flush_pending();
@@ -227,12 +228,18 @@ HRESULT SurfaceRenderer::draw_masked(void* source_id, const DecodedImage& source
         target_rect, clip, std::nullopt, BlendMode::AlphaMask, failure_stage, modulation_color, Sampling::SglFixedPoint);
 }
 
+HRESULT SurfaceRenderer::copy_within(void* id, DecodedImage& image, Rect source_rect, Rect target_rect, RECT clip,
+    const char** failure_stage) noexcept {
+    return draw_impl(id, image, nullptr, nullptr, id, image, source_rect, target_rect, clip, std::nullopt,
+        BlendMode::Opaque, failure_stage, 0xffffffff, Sampling::SglFixedPoint, true);
+}
+
 HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, void* mask_id,
     const DecodedImage* mask, void* target_id, DecodedImage& target, Rect source_rect,
     Rect target_rect, RECT clip, std::optional<std::uint32_t> key, BlendMode blend,
-    const char** failure_stage, std::uint32_t modulation_color, Sampling sampling) noexcept {
+    const char** failure_stage, std::uint32_t modulation_color, Sampling sampling, bool self_copy) noexcept {
     if (failure_stage) *failure_stage = "argument validation";
-    if (!source_id || !target_id || source_id == target_id ||
+    if (!source_id || !target_id || (source_id == target_id) != self_copy ||
         (mask && mask_id == target_id) ||
         ((mask == nullptr) != (mask_id == nullptr)) ||
         ((blend == BlendMode::AlphaMask) != (mask != nullptr)) ||
@@ -275,7 +282,9 @@ HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, 
     if (pending_target_ && pending_target_ != dst->texture.Get()) flush_pending();
     // The last recorded draw leaves its target bound. Unbind it only when this draw reads it; binding a bound render
     // target as a shader resource would silently null the input, while re-binding per draw costs driver time.
-    if (bound_target_ && (bound_target_ == src->texture.Get() || (mask && bound_target_ == mask_surface->texture.Get()))) {
+    // A self-copy reads its snapshot, not the bound target.
+    if (!self_copy && bound_target_ &&
+        (bound_target_ == src->texture.Get() || (mask && bound_target_ == mask_surface->texture.Get()))) {
         context_->OMSetRenderTargets(0, nullptr, nullptr);
         bound_target_ = nullptr;
         compositor_.invalidate_renderer_bindings();
@@ -304,21 +313,37 @@ HRESULT SurfaceRenderer::draw_impl(void* source_id, const DecodedImage& source, 
     const bool writes = written.left < written.right && written.top < written.bottom;
     if (blend != BlendMode::Opaque) {
         if (failure_stage) *failure_stage = "alpha background allocation";
-        hr = create_background(*dst);
+        hr = create_copy_texture(*dst, dst->background, dst->background_view);
         if (FAILED(hr)) return hr;
+    }
+    ID3D11ShaderResourceView* source_view = src->view.Get();
+    if (self_copy) {
+        // The draw reads a snapshot of its source pixels taken after the queued draws, which may write them. The SGL
+        // samplers load texels in [floor(left), ceil(right)); one more texel covers float rounding on the fractional path.
+        if (failure_stage) *failure_stage = "self-copy snapshot allocation";
+        hr = create_copy_texture(*dst, dst->snapshot, dst->snapshot_view);
+        if (FAILED(hr)) return hr;
+        flush_pending();
+        const D3D11_BOX read{static_cast<UINT>(bound(source_rect.left, 0, width, false)),
+            static_cast<UINT>(bound(source_rect.top, 0, height, false)), 0,
+            static_cast<UINT>(std::min(bound(source_rect.right, 0, width, true) + 1, width)),
+            static_cast<UINT>(std::min(bound(source_rect.bottom, 0, height, true) + 1, height)), 1};
+        if (read.left < read.right && read.top < read.bottom)
+            context_->CopySubresourceRegion(dst->snapshot.Get(), 0, read.left, read.top, 0, dst->texture.Get(), 0, &read);
+        source_view = dst->snapshot_view.Get();
     }
     if (failure_stage) *failure_stage = "compositor draw";
     const Compositor::RendererSource renderer_source{source.width, source.height,
         source.format == ImageFormat::Indexed8 ? DXGI_FORMAT_R8_UINT : DXGI_FORMAT_B8G8R8A8_UNORM};
     PendingDraw pending;
     if (mask) {
-        hr = compositor_.prepare(context_.Get(), dst->target.Get(), src->view.Get(),
+        hr = compositor_.prepare(context_.Get(), dst->target.Get(), source_view,
             src->palette_view.Get(), mask_surface->view.Get(), target.width, target.height,
             source_rect, target_rect, clip, std::nullopt, Sampling::SglFixedPoint,
             dst->background_view.Get(), modulation_color, BlendMode::AlphaMask, failure_stage, &renderer_source,
             pending.draw);
     } else {
-        hr = compositor_.prepare(context_.Get(), dst->target.Get(), src->view.Get(),
+        hr = compositor_.prepare(context_.Get(), dst->target.Get(), source_view,
             source.format == ImageFormat::Indexed8 ? src->palette_view.Get() : nullptr, nullptr,
             target.width, target.height, source_rect, target_rect, clip, key, sampling,
             blend != BlendMode::Opaque ? dst->background_view.Get() : nullptr,

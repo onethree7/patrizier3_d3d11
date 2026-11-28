@@ -268,6 +268,71 @@ int main() {
         }
     }
 
+    // Copies onto the same surface read its pixels as before each call, including those of a queued draw just before
+    // and of the previous overlapping copy, also when scaled (fixed-point sampling of the SGL contract).
+    {
+        constexpr std::uint32_t self_width = 40, self_height = 30;
+        std::uint32_t seed = 777;
+        const auto next = [&seed] { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+        const auto random_image = [&](std::uint32_t image_width, std::uint32_t image_height) {
+            sgl::DecodedImage image{image_width, image_height, image_width * 4, sgl::ImageFormat::Bgra32, {}, {}};
+            image.pixels.resize(static_cast<std::size_t>(image.pitch) * image_height);
+            for (auto& byte : image.pixels) byte = static_cast<std::uint8_t>(next());
+            return image;
+        };
+        sgl::DecodedImage self = random_image(self_width, self_height);
+        const sgl::DecodedImage patch = random_image(8, 6);
+        std::vector<std::uint32_t> expected(self_width * self_height);
+        std::memcpy(expected.data(), self.pixels.data(), self.pixels.size());
+        // The SGL contract's fixed-point sampling, applied to a copy of the expected pixels taken before the call.
+        const auto copy = [&](RECT source_rect, RECT target_rect) {
+            const std::vector<std::uint32_t> before = expected;
+            const auto step_x = (static_cast<std::uint32_t>(source_rect.right - source_rect.left) << 16) /
+                static_cast<std::uint32_t>(target_rect.right - target_rect.left);
+            const auto step_y = (static_cast<std::uint32_t>(source_rect.bottom - source_rect.top) << 16) /
+                static_cast<std::uint32_t>(target_rect.bottom - target_rect.top);
+            for (LONG y = target_rect.top; y < target_rect.bottom; ++y) for (LONG x = target_rect.left; x < target_rect.right; ++x) {
+                const auto sx = source_rect.left + static_cast<LONG>(((x - target_rect.left) * step_x + (step_x >> 1)) >> 16);
+                const auto sy = source_rect.top + static_cast<LONG>(((y - target_rect.top) * step_y + (step_y >> 1)) >> 16);
+                expected[static_cast<std::size_t>(y) * self_width + x] = before[static_cast<std::size_t>(sy) * self_width + sx];
+            }
+        };
+        const auto rect = [](RECT value) {
+            return sgl::Rect{static_cast<float>(value.left), static_cast<float>(value.top),
+                static_cast<float>(value.right), static_cast<float>(value.bottom)};
+        };
+        int self_id = 0, patch_id = 0;
+        sgl::SurfaceRenderer self_renderer;
+        const RECT self_clip{0, 0, static_cast<LONG>(self_width), static_cast<LONG>(self_height)};
+        // A queued draw the first copy reads.
+        const RECT patch_target{4, 4, 12, 10};
+        if (FAILED(self_renderer.draw(&patch_id, patch, &self_id, self, sgl::Rect{0, 0, 8, 6}, rect(patch_target), self_clip,
+                std::nullopt, sgl::BlendMode::Opaque))) return 24;
+        for (LONG y = patch_target.top; y < patch_target.bottom; ++y)
+            std::memcpy(expected.data() + static_cast<std::size_t>(y) * self_width + patch_target.left,
+                patch.pixels.data() + static_cast<std::size_t>(y - patch_target.top) * patch.pitch, patch.pitch);
+        const RECT copies[][2] = {
+            {{2, 2, 22, 16}, {6, 5, 26, 19}},     // overlaps the queued draw and its own target
+            {{5, 3, 15, 11}, {12, 9, 27, 21}},    // scaled 10x8 to 15x12, reading the first copy
+            {{20, 10, 36, 26}, {18, 12, 34, 28}}, // overlapping shift back over both
+        };
+        for (const auto& pair : copies) {
+            if (FAILED(self_renderer.copy_within(&self_id, self, rect(pair[0]), rect(pair[1]), self_clip))) return 25;
+            copy(pair[0], pair[1]);
+        }
+        if (FAILED(self_renderer.synchronize_to_cpu(&self_id, self))) return 26;
+        std::size_t differences = 0;
+        for (std::size_t index = 0; index < expected.size(); ++index) {
+            std::uint32_t actual = 0;
+            std::memcpy(&actual, self.pixels.data() + index * 4, 4);
+            differences += actual != expected[index];
+        }
+        if (differences) {
+            std::fprintf(stderr, "GPU self-copy differs from sequential copies in %zu pixels.\n", differences);
+            return 27;
+        }
+    }
+
     std::puts("GPU region copy preserved blended pixels and untouched destination content.");
     return 0;
 }

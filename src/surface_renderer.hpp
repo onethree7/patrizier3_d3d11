@@ -19,6 +19,10 @@ public:
         const DecodedImage& mask, void* target_id, DecodedImage& target, Rect source_rect,
         Rect target_rect, RECT clip, std::uint32_t modulation_color = 0xffffffff,
         const char** failure_stage = nullptr) noexcept;
+    // Opaque copy of a region of a surface onto the same surface, as from its pixels before the call (regions may
+    // overlap), without a CPU readback.
+    HRESULT copy_within(void* id, DecodedImage& image, Rect source_rect, Rect target_rect, RECT clip,
+        const char** failure_stage = nullptr) noexcept;
     HRESULT synchronize_to_cpu(void* id, DecodedImage& image) noexcept;
     // Partial transfers for CPU work confined to a known region of a GPU-current BGRA surface: the readback copies
     // the region's GPU-written pixels to the CPU; the upload copies the region's CPU pixels to the GPU. Neither
@@ -53,6 +57,10 @@ private:
         Microsoft::WRL::ComPtr<ID3D11Texture2D> staging;
         Microsoft::WRL::ComPtr<ID3D11Texture2D> background;
         Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> background_view;
+        // Source pixels of copy_within. Separate from background: the background copies of queued draws are recorded
+        // when the queue is flushed and would overwrite a snapshot that a queued self-copy still reads.
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> snapshot;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> snapshot_view;
         Microsoft::WRL::ComPtr<ID3D11Texture2D> palette;
         Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> palette_view;
         bool cpu_needs_upload = true;
@@ -81,11 +89,13 @@ private:
     HRESULT assign_layer(const Surface& target, const RECT& written, std::uint32_t& layer) noexcept;
     HRESULT surface(void* id, const DecodedImage& image, Surface*& result) noexcept;
     HRESULT upload_cpu_image(Surface& surface, const DecodedImage& image) noexcept;
-    HRESULT create_background(Surface& surface) noexcept;
+    // Creates, once, a shader-readable texture of the surface's size and format for copies of its pixels.
+    HRESULT create_copy_texture(const Surface& surface, Microsoft::WRL::ComPtr<ID3D11Texture2D>& texture,
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>& view) noexcept;
     HRESULT draw_impl(void* source_id, const DecodedImage& source, void* mask_id,
         const DecodedImage* mask, void* target_id, DecodedImage& target, Rect source_rect,
         Rect target_rect, RECT clip, std::optional<std::uint32_t> key, BlendMode blend,
-        const char** failure_stage, std::uint32_t modulation_color, Sampling sampling) noexcept;
+        const char** failure_stage, std::uint32_t modulation_color, Sampling sampling, bool self_copy = false) noexcept;
 
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
