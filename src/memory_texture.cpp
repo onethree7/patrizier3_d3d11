@@ -2073,8 +2073,8 @@ extern "C" void __cdecl sgl_ClearBuffer(std::uint32_t flags, std::uint32_t color
     surface_renderer.mark_cpu_modified(render_destination);
 }
 
-extern "C" void __cdecl sgl_FillSolidRect(int x, int y, int width, int height) {
-    std::lock_guard<TexturesMutex> lock(textures_mutex);
+// Fills within the active clipper's rectangles, or within only_clip (logical, inside the destination) when given.
+static void fill_solid_rect(int x, int y, int width, int height, const RECT* only_clip) {
     const auto entry = textures.find(render_destination);
     if (entry == textures.end()) return;
     if (width <= 0 || height <= 0) return;
@@ -2149,21 +2149,26 @@ extern "C" void __cdecl sgl_FillSolidRect(int x, int y, int width, int height) {
             static_cast<float>(fill.right), static_cast<float>(fill.bottom)};
         sgl::ScreenTransform clip_transform;
         const bool clip_mapped = make_screen_transform(render_destination, image, clip_transform);
-        for (const RECT& clip : cached_draw_clips(image, clip_mapped, clip_transform)) {
+        const auto fill_clip = [&](const RECT& clip) {
             RECT region{std::max(fill.left, clip.left), std::max(fill.top, clip.top),
                 std::min(fill.right, clip.right), std::min(fill.bottom, clip.bottom)};
-            if (!intersect_with(region, {0, 0, static_cast<LONG>(image.width), static_cast<LONG>(image.height)})) continue;
+            if (!intersect_with(region, {0, 0, static_cast<LONG>(image.width), static_cast<LONG>(image.height)})) return;
             const char* failure_stage = nullptr;
             if (FAILED(surface_renderer.draw(fill_source, *fill_source, render_destination, image, {0, 0, 1, 1},
                 target_rect, region, std::nullopt, blend, &failure_stage, modulation)))
                 sgl::unimplemented(failure_stage ? failure_stage : "sgl_FillSolidRect D3D11 fill");
+        };
+        if (only_clip) {
+            RECT mapped{};
+            if (map_draw_clip(*only_clip, clip_mapped, clip_transform, mapped)) fill_clip(mapped);
+        } else {
+            for (const RECT& clip : cached_draw_clips(image, clip_mapped, clip_transform)) fill_clip(clip);
         }
         return;
     }
     if (FAILED(surface_renderer.synchronize_to_cpu(render_destination, image)))
         sgl::unimplemented("sgl_FillSolidRect D3D11 synchronization");
 
-    const auto clips = draw_clip_rectangles(image);
     bool modified = false;
     const std::array<std::uint8_t, 3> color = {
         static_cast<std::uint8_t>(constant_color),
@@ -2193,15 +2198,15 @@ extern "C" void __cdecl sgl_FillSolidRect(int x, int y, int width, int height) {
         }
         if (pixel_size == 4) pixel[3] = 0xff;
     };
-    for (RECT clip : clips) {
+    const auto fill_clip = [&](RECT clip) {
         if (destination_is_screen) {
             RECT mapped_clip{};
-            if (!transform.map_clip(clip, mapped_clip)) continue;
+            if (!transform.map_clip(clip, mapped_clip)) return;
             clip = mapped_clip;
         }
         RECT region{std::max(fill.left, clip.left), std::max(fill.top, clip.top),
             std::min(fill.right, clip.right), std::min(fill.bottom, clip.bottom)};
-        if (!intersect_with(region, {0, 0, static_cast<LONG>(image.width), static_cast<LONG>(image.height)})) continue;
+        if (!intersect_with(region, {0, 0, static_cast<LONG>(image.width), static_cast<LONG>(image.height)})) return;
         modified = true;
 
         for (LONG row = region.top; row < region.bottom; ++row) {
@@ -2212,47 +2217,83 @@ extern "C" void __cdecl sgl_FillSolidRect(int x, int y, int width, int height) {
                 destination += pixel_size;
             }
         }
-    }
+    };
+    if (only_clip) fill_clip(*only_clip);
+    else for (const RECT& clip : draw_clip_rectangles(image)) fill_clip(clip);
     if (modified) surface_renderer.mark_cpu_modified(render_destination);
+}
+
+extern "C" void __cdecl sgl_FillSolidRect(int x, int y, int width, int height) {
+    std::lock_guard<TexturesMutex> lock(textures_mutex);
+    fill_solid_rect(x, y, width, height, nullptr);
 }
 
 // The original calls the render destination's line method (vtable slot 0x58). For surfaces in memory, the offscreen
 // included, it rounds the end points and draws the line between them, both included, in the constant color, clipped
 // by the active clipper. Patrician III draws its diagonal map lines (routes) with it through 0x4bd680 and Patrician II
 // through its counterpart; horizontal and vertical ones go to sgl_FillSolidRect directly, as in the map editor
-// (0x43a0c0). Here each run of the line's pixels in one row (one column for steep lines) is filled as one rectangle.
+// (0x43a0c0). The rasterizer (0x91154, set up by 0x91490) walks the line from its left end point along the major axis
+// in 32-bit fixed point: the minor-axis step is floor(minor * 2^32 / major) and the accumulator starts at one half.
+// An exact half therefore rounds up where the step is exact and down where it was truncated. The line is drawn once per
+// clip rectangle; where it enters a rectangle across the minor axis, the setup finds the first pixel with a strict
+// comparison, so a pixel that reaches the entry row (column) at an exact half is left out of that rectangle. Each run
+// of the line's pixels in one row (one column for steep lines) is filled as one rectangle.
 extern "C" void __cdecl sgl_DrawLine(float x1, float y1, float x2, float y2) {
     constexpr float limit = 1 << 24;
     for (const float value : {x1, y1, x2, y2})
         if (!std::isfinite(value) || value < -limit || value > limit) return;
-    const long start_x = std::lrint(x1), start_y = std::lrint(y1);
-    const long end_x = std::lrint(x2), end_y = std::lrint(y2);
-    const long dx = end_x > start_x ? end_x - start_x : start_x - end_x;
-    const long dy = end_y > start_y ? start_y - end_y : end_y - start_y;
-    const long step_x = start_x < end_x ? 1 : -1, step_y = start_y < end_y ? 1 : -1;
-    const bool steep = -dy > dx;
-    long error = dx + dy;
-    long x = start_x, y = start_y;
-    RECT run{x, y, x, y};
-    const auto flush = [&run] {
-        sgl_FillSolidRect(run.left, run.top, run.right - run.left + 1, run.bottom - run.top + 1);
-    };
-    while (x != end_x || y != end_y) {
-        const long doubled = 2 * error;
-        long next_x = x, next_y = y;
-        if (doubled >= dy) { error += dy; next_x += step_x; }
-        if (doubled <= dx) { error += dx; next_y += step_y; }
-        if (steep ? next_x == x : next_y == y) {
-            run = {std::min(run.left, next_x), std::min(run.top, next_y),
-                std::max(run.right, next_x), std::max(run.bottom, next_y)};
-        } else {
-            flush();
-            run = {next_x, next_y, next_x, next_y};
-        }
-        x = next_x;
-        y = next_y;
+    long start_x = std::lrint(x1), start_y = std::lrint(y1), end_x = std::lrint(x2), end_y = std::lrint(y2);
+    if (end_x < start_x) {
+        std::swap(start_x, end_x);
+        std::swap(start_y, end_y);
     }
-    flush();
+    const long dx = end_x - start_x, dy = end_y - start_y;
+    const bool steep = std::labs(dy) > dx;
+    const long major = steep ? std::labs(dy) : dx, minor = steep ? dx : std::labs(dy);
+    const long major_step = steep && dy < 0 ? -1 : 1, minor_step = !steep && dy < 0 ? -1 : 1;
+    const long major_start = steep ? start_y : start_x, minor_start = steep ? start_x : start_y;
+    const std::uint64_t fraction_step = major ? (static_cast<std::uint64_t>(minor) << 32) / major : 0;
+
+    std::lock_guard<TexturesMutex> lock(textures_mutex);
+    const auto destination = textures.find(render_destination);
+    if (destination == textures.end()) return;
+    std::vector<RECT> clips;
+    collect_draw_clips(destination->second->image, clips);
+    for (const RECT& clip : clips) {
+        const long major_low = steep ? clip.top : clip.left, major_high = (steep ? clip.bottom : clip.right) - 1;
+        const long minor_low = steep ? clip.left : clip.top, minor_high = (steep ? clip.right : clip.bottom) - 1;
+        // Steps whose major coordinate lies in the rectangle.
+        const long first = std::max(0L, major_step > 0 ? major_low - major_start : major_start - major_high);
+        const long last = std::min(major, major_step > 0 ? major_high - major_start : major_start - major_low);
+        // Distance from the start to the entry row (column) when the start lies before it on the minor axis.
+        const long entry = minor_step > 0 ? minor_low - minor_start : minor_start - minor_high;
+        RECT run{};
+        bool open = false;
+        const auto flush = [&] {
+            if (open) fill_solid_rect(run.left, run.top, run.right - run.left + 1, run.bottom - run.top + 1, &clip);
+            open = false;
+        };
+        for (long step = first; step <= last; ++step) {
+            const std::uint64_t position = static_cast<std::uint64_t>(step) * fraction_step + (1ull << 31);
+            const auto offset = static_cast<long>(position >> 32);
+            const long across = minor_start + offset * minor_step;
+            if (across < minor_low || across > minor_high ||
+                (offset == entry && step > first && static_cast<std::uint32_t>(position) == 0)) {
+                flush();
+                continue;
+            }
+            const long along = major_start + step * major_step;
+            const long x = steep ? across : along, y = steep ? along : across;
+            if (open && (steep ? x == run.left : y == run.top)) {
+                run = {std::min(run.left, x), std::min(run.top, y), std::max(run.right, x), std::max(run.bottom, y)};
+            } else {
+                flush();
+                run = {x, y, x, y};
+                open = true;
+            }
+        }
+        flush();
+    }
 }
 
 // The main menu background, drawn only while no game runs.

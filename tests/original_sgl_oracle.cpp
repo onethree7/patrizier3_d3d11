@@ -2474,58 +2474,101 @@ int wmain(int argc, wchar_t** argv) {
     void* new_line_target = replacement_create_memory(32, 24, 0);
     if (!old_line_target || !new_line_target) return 121;
     LockedTexture old_line_pixels = {}, new_line_pixels = {};
-    if (!lock(old_line_target, &old_line_pixels, 2) || !replacement_lock(new_line_target, &new_line_pixels, 2) ||
-        old_line_pixels.width != 32 || old_line_pixels.height != 24 ||
-        new_line_pixels.width != 32 || new_line_pixels.height != 24 ||
-        old_line_pixels.pitch < 32 * 4u || new_line_pixels.pitch < 32 * 4u) return 122;
-    for (std::uint32_t y = 0; y < 24; ++y) {
-        for (std::uint32_t x = 0; x < 32; ++x) {
-            std::memcpy(old_line_pixels.pixels + y * old_line_pixels.pitch + x * 4u, &line_background, 4);
-            std::memcpy(new_line_pixels.pixels + y * new_line_pixels.pitch + x * 4u, &line_background, 4);
+    old_set_color(line_color);
+    replacement_constant(line_color);
+    // Draws one line with both libraries on cleared surfaces and compares every pixel.
+    const auto compare_line = [&](float x1, float y1, float x2, float y2) {
+        set_target(nullptr);
+        replacement_target(nullptr);
+        if (!lock(old_line_target, &old_line_pixels, 2) || !replacement_lock(new_line_target, &new_line_pixels, 2) ||
+            old_line_pixels.width != 32 || old_line_pixels.height != 24 ||
+            new_line_pixels.width != 32 || new_line_pixels.height != 24 ||
+            old_line_pixels.pitch < 32 * 4u || new_line_pixels.pitch < 32 * 4u) return 122;
+        for (std::uint32_t y = 0; y < 24; ++y) {
+            for (std::uint32_t x = 0; x < 32; ++x) {
+                std::memcpy(old_line_pixels.pixels + y * old_line_pixels.pitch + x * 4u, &line_background, 4);
+                std::memcpy(new_line_pixels.pixels + y * new_line_pixels.pitch + x * 4u, &line_background, 4);
+            }
         }
-    }
-    unlock(old_line_target);
-    replacement_unlock(new_line_target);
-    set_target(old_line_target);
-    replacement_target(new_line_target);
+        unlock(old_line_target);
+        replacement_unlock(new_line_target);
+        set_target(old_line_target);
+        replacement_target(new_line_target);
+        original_draw_line(x1, y1, x2, y2);
+        replacement_draw_line(x1, y1, x2, y2);
+        set_target(nullptr);
+        replacement_target(nullptr);
+        if (!lock(old_line_target, &old_line_pixels, 1) || !replacement_lock(new_line_target, &new_line_pixels, 1)) return 123;
+        int result = 0;
+        for (std::uint32_t y = 0; y < 24 && !result; ++y) {
+            for (std::uint32_t x = 0; x < 32; ++x) {
+                std::uint32_t old_pixel = 0, new_pixel = 0;
+                std::memcpy(&old_pixel, old_line_pixels.pixels + y * old_line_pixels.pitch + x * 4u, 4);
+                std::memcpy(&new_pixel, new_line_pixels.pixels + y * new_line_pixels.pitch + x * 4u, 4);
+                if (new_pixel != old_pixel) {
+                    std::fprintf(stderr, "SGL DrawLine (%g,%g)-(%g,%g) differs at (%u,%u): original=%08x replacement=%08x.\n",
+                        x1, y1, x2, y2, x, y, old_pixel, new_pixel);
+                    result = 124;
+                    break;
+                }
+            }
+        }
+        unlock(old_line_target);
+        replacement_unlock(new_line_target);
+        return result;
+    };
+    // Exact halves in both directions of shallow and steep lines (rounded up for an exact fixed-point step, down for a
+    // truncated one), half-pixel end points, points, and random integer, quarter-pixel and long lines that cross the
+    // clip edges, where the original leaves out a pixel that reaches the entry row or column at an exact half.
+    constexpr float fixed_lines[][4] = {
+        {1, 2, 23, 9}, {23, 10, 1, 3}, {3, 21, 11, 1}, {-7, 5, 39, 18}, {31, 23, 0, 0}, {16, 12, 16, 12},
+        {1, 9, 23, 2}, {23, 2, 1, 9}, {23, 9, 1, 2}, {15, 3, 27, 12}, {27, 12, 15, 3},
+        {5, 1, 12, 23}, {12, 23, 5, 1}, {12, 1, 5, 23}, {5, 23, 12, 1}, {6, 0, 30, 12}, {29, 20, 9, 25},
+        {2.5f, 5, 20.5f, 5}, {3, 2.5f, 3, 20.5f}, {3.5f, 6.5f, 27.5f, 6.5f}, {4.5f, 4.5f, 4.5f, 4.5f}, {5.5f, 5.5f, 5.5f, 5.5f}};
+    std::uint32_t line_seed = 4242;
+    const auto next_line_value = [&line_seed] { line_seed = line_seed * 1664525u + 1013904223u; return line_seed >> 8; };
+    const auto compare_lines = [&]() {
+        for (const auto& line : fixed_lines)
+            if (const int result = compare_line(line[0], line[1], line[2], line[3])) return result;
+        for (int index = 0; index < 4500; ++index) {
+            const int kind = index / 1500;
+            const auto coordinate = [&](int range) {
+                if (kind == 0) return static_cast<float>(static_cast<int>(next_line_value() % range) - 2);
+                if (kind == 1) return static_cast<float>(static_cast<int>(next_line_value() % (range * 4)) - 8) / 4.0f;
+                return static_cast<float>(static_cast<int>(next_line_value() % 601) - 300);
+            };
+            const float x1 = coordinate(36), y1 = coordinate(28), x2 = coordinate(36), y2 = coordinate(28);
+            if (const int result = compare_line(x1, y1, x2, y2)) return result;
+        }
+        return 0;
+    };
     clip_mode(1);
     replacement_clip_mode(1);
     clip_rect(2, 2, 30, 22);
     replacement_clip_rect(2, 2, 30, 22);
-    old_set_color(line_color);
-    replacement_constant(line_color);
-    for (const auto& line : std::array<std::array<int, 4>, 6>{
-            std::array<int, 4>{1, 2, 23, 9}, {23, 10, 1, 3}, {3, 21, 11, 1},
-            {-7, 5, 39, 18}, {31, 23, 0, 0}, {16, 12, 16, 12}}) {
-        original_draw_line(static_cast<float>(line[0]), static_cast<float>(line[1]),
-            static_cast<float>(line[2]), static_cast<float>(line[3]));
-        replacement_draw_line(static_cast<float>(line[0]), static_cast<float>(line[1]),
-            static_cast<float>(line[2]), static_cast<float>(line[3]));
-    }
-    if (!lock(old_line_target, &old_line_pixels, 1)) return 125;
-    unlock(old_line_target);
-    set_target(nullptr);
-    replacement_target(nullptr);
+    if (const int result = compare_lines()) return result;
+    // The original draws the line once per clipper rectangle. The rectangles are apart so that both clippers hold the
+    // same two: after overlapping unions and cuts the original merges and orders its rectangles differently, which
+    // keeps the covered pixels equal but moves the entry edges.
+    void* old_line_region = old_create_region();
+    void* new_line_region = new_create_region();
+    if (!old_line_region || !new_line_region) return 125;
+    void* old_line_prior = old_set_region(old_line_region);
+    void* new_line_prior = new_set_region(new_line_region);
+    clip_mode(2);
+    replacement_clip_mode(2);
+    for (const RECT& region : {RECT{3, 3, 12, 12}, RECT{17, 9, 29, 21}}) { old_add(&region); new_add(&region); }
+    const int clipper_result = compare_lines();
+    old_set_region(old_line_prior);
+    new_set_region(new_line_prior);
+    old_free_region(old_line_region);
+    new_free_region(new_line_region);
     clip_mode(0);
     replacement_clip_mode(0);
-    if (!lock(old_line_target, &old_line_pixels, 1) || !replacement_lock(new_line_target, &new_line_pixels, 1)) return 123;
-    for (std::uint32_t y = 0; y < 24; ++y) {
-        for (std::uint32_t x = 0; x < 32; ++x) {
-            std::uint32_t old_pixel = 0, new_pixel = 0;
-            std::memcpy(&old_pixel, old_line_pixels.pixels + y * old_line_pixels.pitch + x * 4u, 4);
-            std::memcpy(&new_pixel, new_line_pixels.pixels + y * new_line_pixels.pitch + x * 4u, 4);
-            if (new_pixel != old_pixel) {
-                std::fprintf(stderr, "SGL DrawLine differs at (%u,%u): original=%08x replacement=%08x.\n",
-                    x, y, old_pixel, new_pixel);
-                return 124;
-            }
-        }
-    }
-    unlock(old_line_target);
-    replacement_unlock(new_line_target);
+    if (clipper_result) return clipper_result;
     free_image(old_line_target);
     replacement_free(new_line_target);
-    std::puts("SGL DrawLine: original and replacement match for six clipped line cases.");
+    std::puts("SGL DrawLine: original and replacement match for 4522 lines under a clip rectangle and under a clipper.");
     std::printf("%s %ux%u source stretch to %ux%u: original and D3D11 replacement match byte-for-byte.\n",
         captured_stretch_source.empty() ? "Synthetic" : "Captured", wide_source_width, wide_source_height,
         wide_target_width, wide_target_height);
